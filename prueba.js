@@ -1,0 +1,1 @@
+console.log("Hola, soy el sistema de GanaPacientes");
