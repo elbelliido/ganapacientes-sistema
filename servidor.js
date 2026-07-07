@@ -23,22 +23,26 @@ QUÉ NO HACES: no inventes precios (di que la primera visita es gratuita), no de
 La fecha de hoy la sabes por contexto; si el paciente dice "mañana" o "el jueves", calcula la fecha real en formato AAAA-MM-DD.`;
 
 // ------------------------------------------------------------
-//  HERRAMIENTA 1: consultar huecos libres en Cal.com
+//  HERRAMIENTA 1: consultar huecos libres en Cal.com (API v2)
 // ------------------------------------------------------------
 async function consultarHuecos(fecha) {
   try {
-    const r = await axios.get("https://api.cal.com/v1/slots", {
+    const r = await axios.get("https://api.cal.com/v2/slots", {
+      headers: {
+        Authorization: `Bearer ${process.env.CAL_API_KEY}`,
+        "cal-api-version": "2024-09-04"
+      },
       params: {
-        apiKey: process.env.CAL_API_KEY,
-        eventTypeId: process.env.CAL_EVENT_TYPE_ID,
-        startTime: `${fecha}T00:00:00Z`,
-        endTime: `${fecha}T23:59:59Z`,
+        eventTypeId: Number(process.env.CAL_EVENT_TYPE_ID),
+        start: fecha,
+        end: fecha,
         timeZone: "Europe/Madrid"
       }
     });
-    const slots = r.data.slots?.[fecha] || [];
-    // Devolvemos solo las horas ("10:00", "10:30"...) para que la IA las ofrezca
-    return slots.map(s => s.time.slice(11, 16));
+    const dias = r.data.data || {};
+    const slots = dias[fecha] || [];
+    // Devolvemos solo la hora ("10:00", "10:30"...)
+    return slots.map(s => s.start.slice(11, 16));
   } catch (e) {
     console.error("Error consultarHuecos:", e.response?.data || e.message);
     return [];
@@ -46,27 +50,32 @@ async function consultarHuecos(fecha) {
 }
 
 // ------------------------------------------------------------
-//  HERRAMIENTA 2: reservar una cita en Cal.com
+//  HERRAMIENTA 2: reservar una cita en Cal.com (API v2)
 // ------------------------------------------------------------
 async function reservarCita(fecha, hora, nombre, telefono) {
   try {
-    const inicio = `${fecha}T${hora}:00.000Z`; // fecha + hora que eligió el paciente
+    const inicio = `${fecha}T${hora}:00.000Z`;
     const r = await axios.post(
-      "https://api.cal.com/v1/bookings?apiKey=" + process.env.CAL_API_KEY,
+      "https://api.cal.com/v2/bookings",
       {
         eventTypeId: Number(process.env.CAL_EVENT_TYPE_ID),
         start: inicio,
-        responses: {
+        attendee: {
           name: nombre,
-          email: "paciente@ganapacientes.es", // Cal.com pide un email; usamos uno genérico
-          notes: `Reserva por WhatsApp. Tel: ${telefono}`
+          email: "paciente@ganapacientes.es",
+          timeZone: "Europe/Madrid",
+          language: "es"
         },
-        timeZone: "Europe/Madrid",
-        language: "es",
-        metadata: {}
+        bookingFieldsResponses: { notes: `Reserva por WhatsApp. Tel: ${telefono}` }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.CAL_API_KEY}`,
+          "cal-api-version": "2024-08-13"
+        }
       }
     );
-    return { ok: true, id: r.data.booking?.id };
+    return { ok: true, id: r.data.data?.id };
   } catch (e) {
     console.error("Error reservarCita:", e.response?.data || e.message);
     return { ok: false };
