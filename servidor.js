@@ -287,5 +287,85 @@ app.get("/campana-dormidos", async (req, res) => {
   await lanzarCampanaDormidos();
   res.send("Campaña lanzada");
 });
+// ============================================================
+//  DASHBOARD — panel visual que lee los datos reales de Supabase
+// ============================================================
+app.get("/dashboard", async (req, res) => {
+  // Traemos los datos
+  const [pac, cit, dor] = await Promise.all([
+    supabase.from("pacientes").select("*"),
+    supabase.from("citas").select("*"),
+    supabase.from("dormidos").select("*")
+  ]);
+  const pacientes = pac.data || [];
+  const citas = cit.data || [];
+  const dormidos = dor.data || [];
+
+  // Métricas de Ingresos Dormidos (la cascada honesta)
+  const contactados = dormidos.filter(d => d.estado !== "pendiente").length;
+  const recuperadosArr = dormidos.filter(d => d.estado === "recuperado");
+  const recuperados = recuperadosArr.length;
+  const eurosRecuperados = recuperadosArr.reduce((s, d) => s + Number(d.importe || 0), 0);
+  const potencial = dormidos.filter(d => d.estado !== "recuperado")
+                            .reduce((s, d) => s + Number(d.importe || 0), 0);
+
+  // Filas de las tablas
+  const filasCitas = citas.map(c =>
+    `<tr><td>${c.nombre||"-"}</td><td>${c.fecha||"-"}</td><td>${c.hora||"-"}</td><td>${c.estado||"-"}</td></tr>`
+  ).join("") || `<tr><td colspan="4">Sin citas todavía</td></tr>`;
+
+  const filasDormidos = dormidos.map(d =>
+    `<tr><td>${d.nombre||"-"}</td><td>${d.tratamiento||"-"}</td><td>${Number(d.importe||0)} €</td>
+     <td><span class="badge ${d.estado}">${d.estado}</span></td></tr>`
+  ).join("") || `<tr><td colspan="4">Sin pacientes dormidos</td></tr>`;
+
+  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Panel · GanaPacientes</title>
+  <style>
+    :root{--tinta:#16212E;--tinta2:#1E2C3B;--hueso:#FAF7F2;--ambar:#E8A24A;--verde:#1EB257;--bruma:#9AA3AE;--borde:#E7E0D6}
+    *{box-sizing:border-box;margin:0;font-family:system-ui,-apple-system,sans-serif}
+    body{background:var(--hueso);color:var(--tinta);padding:2rem;max-width:1100px;margin:0 auto}
+    h1{font-size:1.6rem;margin-bottom:.3rem} .sub{color:var(--bruma);margin-bottom:2rem}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:2.5rem}
+    .card{background:#fff;border:1px solid var(--borde);border-radius:14px;padding:1.4rem}
+    .card .n{font-size:2rem;font-weight:700} .card .l{color:var(--bruma);font-size:.85rem;margin-top:.2rem}
+    .card.euros{background:var(--tinta);color:#fff;border:none} .card.euros .n{color:var(--ambar)}
+    .cascada{background:#fff;border:1px solid var(--borde);border-radius:14px;padding:1.4rem;margin-bottom:2.5rem}
+    .paso{display:flex;justify-content:space-between;padding:.6rem 0;border-bottom:1px solid #f0ece4}
+    .paso b{color:var(--tinta)} .paso span{color:var(--bruma)}
+    h2{font-size:1.1rem;margin:1.5rem 0 .8rem}
+    table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;border:1px solid var(--borde)}
+    th,td{padding:.7rem 1rem;text-align:left;border-bottom:1px solid #f0ece4;font-size:.9rem}
+    th{background:var(--tinta2);color:#fff;font-weight:600}
+    .badge{padding:.2rem .6rem;border-radius:99px;font-size:.75rem;font-weight:600}
+    .badge.pendiente{background:#FFF4E8;color:#C45A0C} .badge.contactado{background:#EEF2FF;color:#1847ED}
+    .badge.recuperado{background:#EDFAF4;color:#0B7A5A}
+  </style></head><body>
+    <h1>Panel de GanaPacientes</h1>
+    <p class="sub">Datos en tiempo real · ejemplo de demostración</p>
+
+    <div class="cards">
+      <div class="card euros"><div class="n">${eurosRecuperados} €</div><div class="l">Ingresos recuperados (confirmados)</div></div>
+      <div class="card"><div class="n">${potencial} €</div><div class="l">Valor potencial en curso</div></div>
+      <div class="card"><div class="n">${pacientes.length}</div><div class="l">Pacientes</div></div>
+      <div class="card"><div class="n">${citas.length}</div><div class="l">Citas agendadas</div></div>
+    </div>
+
+    <div class="cascada">
+      <h2 style="margin-top:0">Recuperación de ingresos · la cascada</h2>
+      <div class="paso"><b>Pacientes en la lista</b><span>${dormidos.length}</span></div>
+      <div class="paso"><b>Contactados</b><span>${contactados}</span></div>
+      <div class="paso"><b>Recuperados (agendaron)</b><span>${recuperados}</span></div>
+      <div class="paso"><b>€ confirmados</b><span>${eurosRecuperados} €</span></div>
+    </div>
+
+    <h2>Citas</h2>
+    <table><tr><th>Paciente</th><th>Fecha</th><th>Hora</th><th>Estado</th></tr>${filasCitas}</table>
+
+    <h2>Ingresos Dormidos</h2>
+    <table><tr><th>Paciente</th><th>Tratamiento</th><th>Importe</th><th>Estado</th></tr>${filasDormidos}</table>
+  </body></html>`);
+});
 
 app.listen(3000, () => console.log("Servidor despierto en el puerto 3000"));
