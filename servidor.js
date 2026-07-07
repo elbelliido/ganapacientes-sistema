@@ -1,30 +1,70 @@
 // ============================================================
-//  GANAPACIENTES · BOT DE WHATSAPP CON IA + AGENDA (Cal.com)
-//  Flujo: paciente escribe -> IA decide -> (consulta/reserva en Cal.com) -> responde
-//  Todo comentado para que puedas leerlo y entenderlo tú.
+//  GANAPACIENTES Â· BOT DE WHATSAPP CON IA + AGENDA + MEMORIA
+//  Piezas: WhatsApp (Meta) Â· IA (OpenAI) Â· Agenda (Cal.com v2) Â· Memoria (Supabase)
+//  Flujo: paciente escribe -> se recupera su historial -> la IA decide
+//         (consultar/reservar en Cal.com) -> responde -> se guarda todo.
+//  Comentado en espaÃ±ol para que puedas leerlo y mantenerlo tÃº.
 // ============================================================
 
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const OpenAI = require("openai");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// La "personalidad" de Lucía. Todo lo que escribas aquí, el bot lo obedece.
-const PERSONALIDAD = `Eres "Lucía", la asistente virtual de la Clínica Dental Sonrisa, por WhatsApp.
-TONO: cercana, amable, tuteas, respuestas BREVES (2-4 frases), algún emoji con moderación.
-QUÉ HACES: resuelves dudas de tratamientos y AYUDAS A PEDIR CITA usando las herramientas disponibles.
-CITAS: cuando el paciente quiera cita, primero consulta los huecos libres de la fecha que diga. Ofrécele las horas. Cuando elija una y te dé su nombre, reserva la cita.
-QUÉ NO HACES: no inventes precios (di que la primera visita es gratuita), no des diagnósticos médicos.
-La fecha de hoy la sabes por contexto; si el paciente dice "mañana" o "el jueves", calcula la fecha real en formato AAAA-MM-DD.`;
+// Cliente de la base de datos (usa la URL y la clave service_role del .env)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // ------------------------------------------------------------
-//  HERRAMIENTA 1: consultar huecos libres en Cal.com (API v2)
+//  PERSONALIDAD DE LUCÃA â€” todo lo que pongas aquÃ­, el bot lo obedece
 // ------------------------------------------------------------
+const PERSONALIDAD = `Eres "LucÃ­a", la recepcionista de la ClÃ­nica Dental Sonrisa. Hablas por WhatsApp con pacientes.
+
+CÃ“MO HABLAS:
+- Como una persona real, cÃ¡lida y natural. NUNCA robÃ³tica ni con listas largas.
+- Frases cortas, tono de WhatsApp. AlgÃºn emoji suelto, sin abusar.
+- No repitas "Â¿en quÃ© puedo ayudarte?". Sigue el hilo de lo que se estÃ¡ hablando.
+
+CITAS (tu tarea principal):
+- Para reservar necesitas 3 cosas: dÃ­a, hora y nombre. Ve pidiÃ©ndolas de forma natural, NO como un formulario.
+- Cuando alguien pida cita, consulta los huecos con consultarHuecos y ofrece solo 2-3 opciones buenas (no toda la lista).
+- EN CUANTO tengas dÃ­a + hora + nombre, reserva INMEDIATAMENTE con reservarCita. No vuelvas a preguntar lo que ya te dijeron.
+- Si el paciente te dio parte de los datos en mensajes anteriores, ÃšSALOS, no los pidas otra vez.
+
+REGLAS:
+- No inventes precios: di que la primera visita es gratuita y sin compromiso.
+- No des diagnÃ³sticos. Ante dolor o urgencia, recomienda venir cuanto antes.
+- SÃ© breve. Esto es WhatsApp, no un email.`;
+
+// ============================================================
+//  MEMORIA (Supabase): leer y guardar el historial de cada paciente
+// ============================================================
+
+// Lee los Ãºltimos 10 mensajes de ese paciente, para que la IA "recuerde" la conversaciÃ³n
+async function leerHistorial(telefono) {
+  const { data } = await supabase
+    .from("conversaciones")
+    .select("rol,contenido")
+    .eq("telefono", telefono)
+    .order("creado", { ascending: true })
+    .limit(10);
+  return (data || []).map(m => ({ role: m.rol, content: m.contenido }));
+}
+
+// Guarda un mensaje en la base de datos (rol = 'user' o 'assistant')
+async function guardarMensaje(telefono, rol, contenido) {
+  await supabase.from("conversaciones").insert({ telefono, rol, contenido });
+}
+
+// ============================================================
+//  AGENDA (Cal.com API v2): consultar huecos y reservar
+// ============================================================
+
+// HERRAMIENTA 1: consulta las horas libres para una fecha ("2026-07-13")
 async function consultarHuecos(fecha) {
   try {
     const r = await axios.get("https://api.cal.com/v2/slots", {
@@ -41,17 +81,14 @@ async function consultarHuecos(fecha) {
     });
     const dias = r.data.data || {};
     const slots = dias[fecha] || [];
-    // Devolvemos solo la hora ("10:00", "10:30"...)
-    return slots.map(s => s.start.slice(11, 16));
+    return slots.map(s => s.start.slice(11, 16)); // ["09:00","09:30",...]
   } catch (e) {
     console.error("Error consultarHuecos:", e.response?.data || e.message);
     return [];
   }
 }
 
-// ------------------------------------------------------------
-//  HERRAMIENTA 2: reservar una cita en Cal.com (API v2)
-// ------------------------------------------------------------
+// HERRAMIENTA 2: reserva la cita en Cal.com y la guarda en la base de datos
 async function reservarCita(fecha, hora, nombre, telefono) {
   try {
     const inicio = `${fecha}T${hora}:00.000Z`;
@@ -62,7 +99,7 @@ async function reservarCita(fecha, hora, nombre, telefono) {
         start: inicio,
         attendee: {
           name: nombre,
-          email: "paciente@ganapacientes.es",
+          email: "paciente@ganapacientes.es", // Cal.com exige email; genÃ©rico de momento
           timeZone: "Europe/Madrid",
           language: "es"
         },
@@ -75,6 +112,8 @@ async function reservarCita(fecha, hora, nombre, telefono) {
         }
       }
     );
+    // Guardamos la cita tambiÃ©n en nuestra base de datos
+    await supabase.from("citas").insert({ telefono, nombre, fecha, hora });
     return { ok: true, id: r.data.data?.id };
   } catch (e) {
     console.error("Error reservarCita:", e.response?.data || e.message);
@@ -82,13 +121,13 @@ async function reservarCita(fecha, hora, nombre, telefono) {
   }
 }
 
-// Descripción de las herramientas PARA la IA (así sabe que existen y cuándo usarlas)
+// DescripciÃ³n de las herramientas PARA la IA (asÃ­ sabe que existen y cuÃ¡ndo usarlas)
 const TOOLS = [
   {
     type: "function",
     function: {
       name: "consultarHuecos",
-      description: "Consulta las horas libres de la clínica para una fecha concreta.",
+      description: "Consulta las horas libres de la clÃ­nica para una fecha concreta.",
       parameters: {
         type: "object",
         properties: { fecha: { type: "string", description: "Fecha en formato AAAA-MM-DD" } },
@@ -100,7 +139,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "reservarCita",
-      description: "Reserva una cita cuando el paciente ha elegido una hora y ha dado su nombre.",
+      description: "Reserva una cita cuando el paciente ha elegido hora y ha dado su nombre.",
       parameters: {
         type: "object",
         properties: {
@@ -114,7 +153,7 @@ const TOOLS = [
   }
 ];
 
-// Ejecuta la herramienta que la IA haya pedido y devuelve el resultado como texto
+// Ejecuta la herramienta que la IA pidiÃ³ y devuelve el resultado como texto (para dÃ¡rselo de vuelta a la IA)
 async function ejecutarHerramienta(nombre, args, telefonoPaciente) {
   if (nombre === "consultarHuecos") {
     const huecos = await consultarHuecos(args.fecha);
@@ -127,22 +166,22 @@ async function ejecutarHerramienta(nombre, args, telefonoPaciente) {
   return JSON.stringify({ error: "herramienta desconocida" });
 }
 
-// ------------------------------------------------------------
-//  1) SALUDO DE VERIFICACIÓN DEL WEBHOOK (Meta llama una vez con GET)
-// ------------------------------------------------------------
+// ============================================================
+//  WEBHOOK 1) Saludo de verificaciÃ³n (Meta llama una vez con GET)
+// ============================================================
 app.get("/webhook", (req, res) => {
   if (req.query["hub.mode"] === "subscribe" &&
       req.query["hub.verify_token"] === process.env.VERIFY_TOKEN) {
-    console.log("✅ Webhook verificado");
+    console.log("âœ… Webhook verificado");
     res.status(200).send(req.query["hub.challenge"]);
   } else {
     res.sendStatus(403);
   }
 });
 
-// ------------------------------------------------------------
-//  2) RECIBIR MENSAJE -> IA (con herramientas) -> RESPONDER POR WHATSAPP
-// ------------------------------------------------------------
+// ============================================================
+//  WEBHOOK 2) Recibir mensaje -> memoria -> IA (con herramientas) -> responder -> guardar
+// ============================================================
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // avisamos a Meta "recibido" enseguida
 
@@ -154,15 +193,19 @@ app.post("/webhook", async (req, res) => {
     const textoPaciente = mensaje.text.body;
     const numeroPaciente = mensaje.from;
     const hoy = new Date().toISOString().slice(0, 10); // fecha de hoy AAAA-MM-DD
-    console.log("📩 Paciente dice:", textoPaciente);
+    console.log("ðŸ“© Paciente dice:", textoPaciente);
 
-    // Historial de esta respuesta (system + lo que dice el paciente)
+    // 1) Recuperamos el historial de este paciente (MEMORIA) y montamos el contexto
+    const historial = await leerHistorial(numeroPaciente);
     const messages = [
       { role: "system", content: PERSONALIDAD + `\nHoy es ${hoy}.` },
+      ...historial,
       { role: "user", content: textoPaciente }
     ];
+    // Guardamos ya el mensaje del paciente
+    await guardarMensaje(numeroPaciente, "user", textoPaciente);
 
-    // PRIMERA llamada: la IA decide si responde o si quiere usar una herramienta
+    // 2) Primera llamada a la IA: decide si responde o si quiere usar una herramienta
     let respuesta = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
@@ -170,18 +213,17 @@ app.post("/webhook", async (req, res) => {
     });
     let msg = respuesta.choices[0].message;
 
-    // Bucle: mientras la IA pida herramientas, las ejecutamos y le devolvemos el resultado
-    // (puede encadenar: primero consultar huecos, luego reservar)
+    // 3) Bucle: mientras la IA pida herramientas, las ejecutamos y le devolvemos el resultado
+    //    (puede encadenar: primero consultar huecos, luego reservar)
     let vueltas = 0;
     while (msg.tool_calls && vueltas < 3) {
-      messages.push(msg); // guardamos lo que pidió la IA
+      messages.push(msg);
       for (const call of msg.tool_calls) {
         const args = JSON.parse(call.function.arguments);
         const resultado = await ejecutarHerramienta(call.function.name, args, numeroPaciente);
-        console.log("🔧 Herramienta:", call.function.name, args, "->", resultado);
+        console.log("ðŸ”§ Herramienta:", call.function.name, args, "->", resultado);
         messages.push({ role: "tool", tool_call_id: call.id, content: resultado });
       }
-      // Volvemos a preguntar a la IA con los resultados, para que redacte o pida otra cosa
       respuesta = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages,
@@ -191,19 +233,22 @@ app.post("/webhook", async (req, res) => {
       vueltas++;
     }
 
-    const textoRespuesta = msg.content || "Perdona, ¿me lo repites? 🙂";
-    console.log("🤖 IA responde:", textoRespuesta);
+    const textoRespuesta = msg.content || "Perdona, Â¿me lo repites? ðŸ™‚";
+    console.log("ðŸ¤– IA responde:", textoRespuesta);
 
-    // Enviamos la respuesta al paciente por WhatsApp
+    // 4) Guardamos la respuesta de LucÃ­a en la memoria
+    await guardarMensaje(numeroPaciente, "assistant", textoRespuesta);
+
+    // 5) Enviamos la respuesta al paciente por WhatsApp
     await axios.post(
       `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`,
       { messaging_product: "whatsapp", to: numeroPaciente, text: { body: textoRespuesta } },
       { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
     );
-    console.log("✅ Respuesta enviada al paciente");
+    console.log("âœ… Respuesta enviada al paciente");
 
   } catch (error) {
-    console.error("❌ Error:", error.response?.data || error.message);
+    console.error("âŒ Error:", error.response?.data || error.message);
   }
 });
 
