@@ -1,4 +1,10 @@
-require("dotenv").config();               // carga las claves del .env
+// ============================================================
+//  GANAPACIENTES · BOT DE WHATSAPP CON IA + AGENDA (Cal.com)
+//  Flujo: paciente escribe -> IA decide -> (consulta/reserva en Cal.com) -> responde
+//  Todo comentado para que puedas leerlo y entenderlo tú.
+// ============================================================
+
+require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const OpenAI = require("openai");
@@ -6,10 +12,115 @@ const OpenAI = require("openai");
 const app = express();
 app.use(express.json());
 
-// Cliente de OpenAI (usa la clave del .env)
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// 1) SALUDO DE VERIFICACIÓN (igual que antes)
+// La "personalidad" de Lucía. Todo lo que escribas aquí, el bot lo obedece.
+const PERSONALIDAD = `Eres "Lucía", la asistente virtual de la Clínica Dental Sonrisa, por WhatsApp.
+TONO: cercana, amable, tuteas, respuestas BREVES (2-4 frases), algún emoji con moderación.
+QUÉ HACES: resuelves dudas de tratamientos y AYUDAS A PEDIR CITA usando las herramientas disponibles.
+CITAS: cuando el paciente quiera cita, primero consulta los huecos libres de la fecha que diga. Ofrécele las horas. Cuando elija una y te dé su nombre, reserva la cita.
+QUÉ NO HACES: no inventes precios (di que la primera visita es gratuita), no des diagnósticos médicos.
+La fecha de hoy la sabes por contexto; si el paciente dice "mañana" o "el jueves", calcula la fecha real en formato AAAA-MM-DD.`;
+
+// ------------------------------------------------------------
+//  HERRAMIENTA 1: consultar huecos libres en Cal.com
+// ------------------------------------------------------------
+async function consultarHuecos(fecha) {
+  try {
+    const r = await axios.get("https://api.cal.com/v1/slots", {
+      params: {
+        apiKey: process.env.CAL_API_KEY,
+        eventTypeId: process.env.CAL_EVENT_TYPE_ID,
+        startTime: `${fecha}T00:00:00Z`,
+        endTime: `${fecha}T23:59:59Z`,
+        timeZone: "Europe/Madrid"
+      }
+    });
+    const slots = r.data.slots?.[fecha] || [];
+    // Devolvemos solo las horas ("10:00", "10:30"...) para que la IA las ofrezca
+    return slots.map(s => s.time.slice(11, 16));
+  } catch (e) {
+    console.error("Error consultarHuecos:", e.response?.data || e.message);
+    return [];
+  }
+}
+
+// ------------------------------------------------------------
+//  HERRAMIENTA 2: reservar una cita en Cal.com
+// ------------------------------------------------------------
+async function reservarCita(fecha, hora, nombre, telefono) {
+  try {
+    const inicio = `${fecha}T${hora}:00.000Z`; // fecha + hora que eligió el paciente
+    const r = await axios.post(
+      "https://api.cal.com/v1/bookings?apiKey=" + process.env.CAL_API_KEY,
+      {
+        eventTypeId: Number(process.env.CAL_EVENT_TYPE_ID),
+        start: inicio,
+        responses: {
+          name: nombre,
+          email: "paciente@ganapacientes.es", // Cal.com pide un email; usamos uno genérico
+          notes: `Reserva por WhatsApp. Tel: ${telefono}`
+        },
+        timeZone: "Europe/Madrid",
+        language: "es",
+        metadata: {}
+      }
+    );
+    return { ok: true, id: r.data.booking?.id };
+  } catch (e) {
+    console.error("Error reservarCita:", e.response?.data || e.message);
+    return { ok: false };
+  }
+}
+
+// Descripción de las herramientas PARA la IA (así sabe que existen y cuándo usarlas)
+const TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "consultarHuecos",
+      description: "Consulta las horas libres de la clínica para una fecha concreta.",
+      parameters: {
+        type: "object",
+        properties: { fecha: { type: "string", description: "Fecha en formato AAAA-MM-DD" } },
+        required: ["fecha"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "reservarCita",
+      description: "Reserva una cita cuando el paciente ha elegido una hora y ha dado su nombre.",
+      parameters: {
+        type: "object",
+        properties: {
+          fecha: { type: "string", description: "Fecha AAAA-MM-DD" },
+          hora: { type: "string", description: "Hora HH:MM (24h)" },
+          nombre: { type: "string", description: "Nombre del paciente" }
+        },
+        required: ["fecha", "hora", "nombre"]
+      }
+    }
+  }
+];
+
+// Ejecuta la herramienta que la IA haya pedido y devuelve el resultado como texto
+async function ejecutarHerramienta(nombre, args, telefonoPaciente) {
+  if (nombre === "consultarHuecos") {
+    const huecos = await consultarHuecos(args.fecha);
+    return JSON.stringify({ huecosLibres: huecos });
+  }
+  if (nombre === "reservarCita") {
+    const res = await reservarCita(args.fecha, args.hora, args.nombre, telefonoPaciente);
+    return JSON.stringify(res.ok ? { reservado: true } : { reservado: false });
+  }
+  return JSON.stringify({ error: "herramienta desconocida" });
+}
+
+// ------------------------------------------------------------
+//  1) SALUDO DE VERIFICACIÓN DEL WEBHOOK (Meta llama una vez con GET)
+// ------------------------------------------------------------
 app.get("/webhook", (req, res) => {
   if (req.query["hub.mode"] === "subscribe" &&
       req.query["hub.verify_token"] === process.env.VERIFY_TOKEN) {
@@ -20,68 +131,66 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// 2) RECIBIR MENSAJE → PENSAR CON IA → RESPONDER POR WHATSAPP
+// ------------------------------------------------------------
+//  2) RECIBIR MENSAJE -> IA (con herramientas) -> RESPONDER POR WHATSAPP
+// ------------------------------------------------------------
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // avisamos a Meta "recibido" enseguida
 
   try {
-    // Sacamos el mensaje de dentro del paquete que manda Meta
     const entrada = req.body.entry?.[0]?.changes?.[0]?.value;
     const mensaje = entrada?.messages?.[0];
-
-    // Si no es un mensaje de texto (ej: notificación de estado), lo ignoramos
     if (!mensaje || mensaje.type !== "text") return;
 
-    const textoPaciente = mensaje.text.body;   // lo que escribió el paciente
-    const numeroPaciente = mensaje.from;        // su número
-
+    const textoPaciente = mensaje.text.body;
+    const numeroPaciente = mensaje.from;
+    const hoy = new Date().toISOString().slice(0, 10); // fecha de hoy AAAA-MM-DD
     console.log("📩 Paciente dice:", textoPaciente);
 
-    // --- La IA piensa la respuesta ---
-   const respuestaIA = await openai.chat.completions.create({
+    // Historial de esta respuesta (system + lo que dice el paciente)
+    const messages = [
+      { role: "system", content: PERSONALIDAD + `\nHoy es ${hoy}.` },
+      { role: "user", content: textoPaciente }
+    ];
+
+    // PRIMERA llamada: la IA decide si responde o si quiere usar una herramienta
+    let respuesta = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `Eres "Lucía", la asistente virtual de la Clínica Dental Sonrisa, por WhatsApp.
-
-TONO:
-- Cercana, amable y profesional. Tuteas al paciente.
-- Respuestas BREVES (es WhatsApp): 2-4 frases máximo.
-- Usa algún emoji con moderación cuando encaje, sin abusar.
-
-QUÉ HACES:
-- Resuelves dudas generales sobre tratamientos (limpiezas, ortodoncia, implantes, estética dental).
-- Ayudas al paciente a pedir cita: le pides su nombre y qué día/hora le viene bien, y le dices que el equipo se lo confirmará.
-- Si preguntan por horarios: la clínica abre de lunes a viernes, de 9:00 a 20:00.
-
-QUÉ NO HACES NUNCA:
-- No inventes precios. Si preguntan cuánto cuesta algo, di que depende de cada caso y que la primera visita es gratuita y sin compromiso.
-- No des diagnósticos ni consejos médicos concretos. Ante dolor o urgencia, recomienda pedir cita cuanto antes.
-- No prometas resultados ni plazos médicos.
-
-OBJETIVO:
-- Que el paciente termine pidiendo cita o dejando sus datos para que le llamen. Empuja suavemente hacia eso, sin ser pesada.`
-        },
-        { role: "user", content: textoPaciente }
-      ]
+      messages,
+      tools: TOOLS
     });
+    let msg = respuesta.choices[0].message;
 
+    // Bucle: mientras la IA pida herramientas, las ejecutamos y le devolvemos el resultado
+    // (puede encadenar: primero consultar huecos, luego reservar)
+    let vueltas = 0;
+    while (msg.tool_calls && vueltas < 3) {
+      messages.push(msg); // guardamos lo que pidió la IA
+      for (const call of msg.tool_calls) {
+        const args = JSON.parse(call.function.arguments);
+        const resultado = await ejecutarHerramienta(call.function.name, args, numeroPaciente);
+        console.log("🔧 Herramienta:", call.function.name, args, "->", resultado);
+        messages.push({ role: "tool", tool_call_id: call.id, content: resultado });
+      }
+      // Volvemos a preguntar a la IA con los resultados, para que redacte o pida otra cosa
+      respuesta = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+        tools: TOOLS
+      });
+      msg = respuesta.choices[0].message;
+      vueltas++;
+    }
 
-    const textoRespuesta = respuestaIA.choices[0].message.content;
+    const textoRespuesta = msg.content || "Perdona, ¿me lo repites? 🙂";
     console.log("🤖 IA responde:", textoRespuesta);
 
-    // --- Enviamos la respuesta de vuelta al paciente por WhatsApp ---
+    // Enviamos la respuesta al paciente por WhatsApp
     await axios.post(
       `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to: numeroPaciente,
-        text: { body: textoRespuesta }
-      },
+      { messaging_product: "whatsapp", to: numeroPaciente, text: { body: textoRespuesta } },
       { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
     );
-
     console.log("✅ Respuesta enviada al paciente");
 
   } catch (error) {
