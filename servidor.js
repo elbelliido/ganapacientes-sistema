@@ -251,5 +251,41 @@ app.post("/webhook", async (req, res) => {
     console.error("âŒ Error:", error.response?.data || error.message);
   }
 });
+// Envía la plantilla a todos los pacientes "pendiente"
+async function lanzarCampanaDormidos() {
+  const { data } = await supabase.from("dormidos").select("*").eq("estado", "pendiente");
+  for (const p of (data || [])) {
+    try {
+      await axios.post(
+        `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`,
+        {
+          messaging_product: "whatsapp",
+          to: p.telefono,
+          type: "template",
+          template: {
+            name: "reactivacion_presupuesto",
+            language: { code: "es" },
+            components: [{
+              type: "body",
+              parameters: [
+                { type: "text", text: p.nombre || "" },
+                { type: "text", text: p.tratamiento || "tu tratamiento" }
+              ]
+            }]
+          }
+        },
+        { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
+      );
+      await supabase.from("dormidos").update({ estado: "contactado" }).eq("id", p.id);
+      console.log("📤 Reactivación enviada a", p.nombre);
+    } catch (e) { console.error("Error campaña:", e.response?.data || e.message); }
+  }
+}
+
+// Ruta secreta para lanzar la campaña (visítala en el navegador para dispararla)
+app.get("/campana-dormidos", async (req, res) => {
+  await lanzarCampanaDormidos();
+  res.send("Campaña lanzada");
+});
 
 app.listen(3000, () => console.log("Servidor despierto en el puerto 3000"));
