@@ -58,7 +58,7 @@ const pausa = ms => new Promise(r => setTimeout(r, ms));
 // ------------------------------------------------------------
 //  ENVÍO DE PLANTILLAS DE WHATSAPP (con parámetros)
 // ------------------------------------------------------------
-async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = []) {
+async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = [], idioma = "es") {
   try {
     await axios.post(
       `https://graph.facebook.com/v21.0/${clinica.phone_number_id}/messages`,
@@ -68,7 +68,7 @@ async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = 
         type: "template",
         template: {
           name: nombrePlantilla,
-          language: { code: "es" },
+          language: { code: idioma },
           components: parametros.length
             ? [{ type: "body", parameters: parametros.map(p => ({ type: "text", text: String(p) })) }]
             : []
@@ -78,7 +78,12 @@ async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = 
     );
     return true;
   } catch (e) {
-    console.error(`   ❌ Plantilla ${nombrePlantilla} → ${telefono}:`, JSON.stringify(e.response?.data?.error?.message || e.message));
+    const err = e.response?.data?.error;
+    // Si la plantilla no existe en "es", reintentamos una vez con "es_ES"
+    if (err?.code === 132001 && idioma === "es") {
+      return enviarPlantilla(clinica, telefono, nombrePlantilla, parametros, "es_ES");
+    }
+    console.error(`   ❌ Plantilla ${nombrePlantilla} [${idioma}] → ${telefono}:`, JSON.stringify(err?.message || e.message));
     return false;
   }
 }
