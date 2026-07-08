@@ -120,7 +120,7 @@ async function enviarWhatsAppTexto(clinica, telefono, texto) {
   }
 }
 
-async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = []) {
+async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = [], idioma = "es") {
   try {
     await axios.post(
       `https://graph.facebook.com/v21.0/${clinica.phone_number_id}/messages`,
@@ -130,7 +130,7 @@ async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = 
         type: "template",
         template: {
           name: nombrePlantilla,
-          language: { code: "es" },
+          language: { code: idioma },
           components: parametros.length
             ? [{ type: "body", parameters: parametros.map(p => ({ type: "text", text: String(p) })) }]
             : []
@@ -140,7 +140,12 @@ async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = 
     );
     return true;
   } catch (e) {
-    console.error(`❌ Error enviando plantilla [${clinica.nombre_clinica}]:`, e.response?.data || e.message);
+    const err = e.response?.data?.error;
+    // Si no existe en "es", probamos "es_ES" (español de España) una vez
+    if (err?.code === 132001 && idioma === "es") {
+      return enviarPlantilla(clinica, telefono, nombrePlantilla, parametros, "es_ES");
+    }
+    console.error(`   ❌ Plantilla ${nombrePlantilla} [${idioma}] → ${telefono}:`, JSON.stringify(err?.message || e.message));
     return false;
   }
 }
