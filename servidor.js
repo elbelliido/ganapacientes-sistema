@@ -433,27 +433,29 @@ app.get("/campana-dormidos", async (req, res) => {
 });
 
 // ============================================================
-//  DASHBOARD MULTI-CLÍNICA + LOGIN
-//  Uso: /dashboard?clave=TU_CLAVE&clinica=1
+//  DASHBOARD v2 · GANAPACIENTES
+//  INSTRUCCIONES: en servidor.js, borra el bloque app.get("/dashboard", ...)
+//  ENTERO (desde app.get("/dashboard" hasta su }); de cierre) y pega
+//  este en su lugar. El app.use("/dashboard", ...) del login NO se toca.
 // ============================================================
-app.use("/dashboard", (req, res, next) => {
-  if (req.query.clave === process.env.DASHBOARD_CLAVE) return next();
-  res.status(401).send("Acceso restringido. Añade ?clave=... a la URL");
-});
 
 app.get("/dashboard", async (req, res) => {
   const clinicaId = Number(req.query.clinica || 1);
 
-  const [cli, pac, cit, dor] = await Promise.all([
+  const [cli, cit, dor, conv] = await Promise.all([
     supabase.from("clinicas").select("*").eq("id", clinicaId).single(),
-    supabase.from("pacientes").select("*").eq("clinica_id", clinicaId),
-    supabase.from("citas").select("*").eq("clinica_id", clinicaId).order("fecha", { ascending: false }),
-    supabase.from("dormidos").select("*").eq("clinica_id", clinicaId)
+    supabase.from("citas").select("*").eq("clinica_id", clinicaId).order("fecha", { ascending: true }).order("hora", { ascending: true }),
+    supabase.from("dormidos").select("*").eq("clinica_id", clinicaId),
+    supabase.from("conversaciones").select("telefono").eq("clinica_id", clinicaId)
   ]);
   const clinica = cli.data || { nombre_clinica: "Clínica" };
-  const pacientes = pac.data || [], citas = cit.data || [], dormidos = dor.data || [];
+  const citas = cit.data || [], dormidos = dor.data || [];
 
-  // La cascada honesta: bajas separadas, no maquilladas
+  // Conversaciones = teléfonos únicos que han hablado con el bot (dato REAL,
+  // sustituye a la antigua tarjeta "Pacientes" que leía una tabla vacía)
+  const conversaciones = new Set((conv.data || []).map(c => c.telefono)).size;
+
+  // Cascada honesta (las bajas RGPD se cuentan aparte, nunca se maquillan)
   const bajas = dormidos.filter(d => d.estado === "baja");
   const activos = dormidos.filter(d => d.estado !== "baja");
   const contactados = activos.filter(d => d.estado !== "pendiente").length;
@@ -461,55 +463,150 @@ app.get("/dashboard", async (req, res) => {
   const eurosRec = recArr.reduce((s, d) => s + Number(d.importe || 0), 0);
   const potencial = activos.filter(d => d.estado !== "recuperado").reduce((s, d) => s + Number(d.importe || 0), 0);
 
-  const clave = encodeURIComponent(req.query.clave);
-  const filasCitas = citas.map(c => `<tr><td>${c.nombre || "-"}</td><td>${c.fecha || "-"}</td><td>${c.hora || "-"}</td><td>${c.estado || "confirmada"}</td></tr>`).join("") || `<tr><td colspan="4">Sin citas todavía</td></tr>`;
-  const filasDor = dormidos.map(d => `<tr><td>${d.nombre || "-"}</td><td>${d.tratamiento || "-"}</td><td>${Number(d.importe || 0)} €</td><td><span class="badge ${d.estado}">${d.estado}</span></td></tr>`).join("") || `<tr><td colspan="4">Sin dormidos. Súbelos desde "Importar CSV".</td></tr>`;
+  // Anchos del funnel (relativos al total de la lista)
+  const pct = n => activos.length ? Math.max(Math.round(n / activos.length * 100), n > 0 ? 8 : 0) : 0;
 
-  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Panel · ${clinica.nombre_clinica}</title><style>
-    :root{--tinta:#16212E;--tinta2:#1E2C3B;--hueso:#FAF7F2;--ambar:#E8A24A;--bruma:#9AA3AE;--borde:#E7E0D6}
-    *{box-sizing:border-box;margin:0;font-family:system-ui,sans-serif}
-    body{background:var(--hueso);color:var(--tinta);padding:2rem;max-width:1100px;margin:0 auto}
+  // Citas: separamos próximas y pasadas
+  const hoy = hoyMadrid();
+  const proximas = citas.filter(c => (c.fecha || "") >= hoy);
+  const pasadas = citas.filter(c => (c.fecha || "") < hoy).reverse();
+
+  const fmtFecha = f => {
+    if (!f) return "—";
+    const d = new Date(f + "T12:00:00");
+    return d.toLocaleDateString("es-ES", { weekday: "short", day: "numeric", month: "short" });
+  };
+  const fmtEuros = n => n.toLocaleString("es-ES") + " €";
+
+  const filaCita = c => `<tr><td>${c.nombre || "—"}</td><td>${fmtFecha(c.fecha)}</td><td>${c.hora || "—"}</td><td><span class="chip ok">${c.estado || "reservada"}</span></td></tr>`;
+  const filasProximas = proximas.map(filaCita).join("") || `<tr><td colspan="4" class="vacio">Sin citas próximas — cuando Lucía reserve, aparecerán aquí</td></tr>`;
+  const filasPasadas = pasadas.slice(0, 10).map(filaCita).join("");
+
+  const filasDor = dormidos
+    .sort((a, b) => Number(b.importe || 0) - Number(a.importe || 0))
+    .map(d => `<tr><td>${d.nombre || "—"}</td><td>${d.tratamiento || "—"}</td><td class="num">${fmtEuros(Number(d.importe || 0))}</td><td><span class="chip ${d.estado}">${d.estado}</span></td></tr>`)
+    .join("") || `<tr><td colspan="4" class="vacio">Sin pacientes en la lista — impórtalos con el botón «Importar CSV»</td></tr>`;
+
+  const clave = encodeURIComponent(req.query.clave);
+  const fechaHoy = new Date().toLocaleDateString("es-ES", { timeZone: "Europe/Madrid", weekday: "long", day: "numeric", month: "long", year: "numeric" });
+
+  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Panel · ${clinica.nombre_clinica}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --tinta:#16212E; --tinta2:#1E2C3B; --hueso:#FAF7F2; --hueso2:#F2EDE4;
+      --ambar:#E8A24A; --ambar-osc:#B57724; --bruma:#9AA3AE; --borde:#E7E0D6;
+      --verde:#0B7A5A; --verde-bg:#EDFAF4; --azul:#1847ED; --azul-bg:#EEF2FF;
+      --naranja:#C45A0C; --naranja-bg:#FFF4E8; --rojo:#C42B2B; --rojo-bg:#FEF2F2;
+    }
+    *{box-sizing:border-box;margin:0}
+    body{background:var(--hueso);color:var(--tinta);font-family:Inter,system-ui,sans-serif;padding:2.2rem 1.4rem;max-width:1100px;margin:0 auto}
+    h1,h2{font-family:Fraunces,serif}
+
+    /* Cabecera */
     header{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:1rem;margin-bottom:2rem}
-    h1{font-size:1.6rem}.sub{color:var(--bruma)}
-    .acciones a{display:inline-block;background:var(--tinta);color:#fff;text-decoration:none;padding:.55rem 1rem;border-radius:10px;font-size:.85rem;margin-left:.5rem}
-    .acciones a.ambar{background:var(--ambar);color:var(--tinta);font-weight:700}
-    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:2.5rem}
-    .card{background:#fff;border:1px solid var(--borde);border-radius:14px;padding:1.4rem}
-    .card .n{font-size:2rem;font-weight:700}.card .l{color:var(--bruma);font-size:.85rem;margin-top:.2rem}
-    .card.euros{background:var(--tinta);color:#fff;border:none}.card.euros .n{color:var(--ambar)}
-    .cascada{background:#fff;border:1px solid var(--borde);border-radius:14px;padding:1.4rem;margin-bottom:2.5rem}
-    .paso{display:flex;justify-content:space-between;padding:.6rem 0;border-bottom:1px solid #f0ece4}.paso span{color:var(--bruma)}
-    h2{font-size:1.1rem;margin:1.5rem 0 .8rem}
-    table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;border:1px solid var(--borde)}
-    th,td{padding:.7rem 1rem;text-align:left;border-bottom:1px solid #f0ece4;font-size:.9rem}th{background:var(--tinta2);color:#fff}
-    .badge{padding:.2rem .6rem;border-radius:99px;font-size:.75rem;font-weight:600}
-    .badge.pendiente{background:#FFF4E8;color:#C45A0C}.badge.contactado{background:#EEF2FF;color:#1847ED}
-    .badge.recuperado{background:#EDFAF4;color:#0B7A5A}.badge.baja{background:#FEF2F2;color:#C42B2B}
-    .rgpd{font-size:.8rem;color:var(--bruma);margin-top:2rem}
+    .marca{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ambar-osc);font-weight:700;margin-bottom:.35rem}
+    h1{font-size:2rem;font-weight:700;letter-spacing:-.01em}
+    .sub{color:var(--bruma);font-size:.85rem;margin-top:.3rem;text-transform:capitalize}
+    .acciones{display:flex;gap:.6rem}
+    .btn{display:inline-block;text-decoration:none;padding:.65rem 1.2rem;border-radius:12px;font-size:.85rem;font-weight:600;transition:transform .15s,box-shadow .15s}
+    .btn:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(22,33,46,.14)}
+    .btn.sec{background:#fff;color:var(--tinta);border:1px solid var(--borde)}
+    .btn.pri{background:var(--ambar);color:var(--tinta)}
+
+    /* Tarjetas KPI */
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.4rem}
+    .card{background:#fff;border:1px solid var(--borde);border-radius:18px;padding:1.5rem 1.4rem;position:relative;overflow:hidden}
+    .card .n{font-family:Fraunces,serif;font-size:2.3rem;font-weight:700;letter-spacing:-.02em;line-height:1}
+    .card .l{color:var(--bruma);font-size:.8rem;margin-top:.55rem;font-weight:500}
+    .card.euros{background:linear-gradient(135deg,var(--tinta) 0%,var(--tinta2) 100%);color:#fff;border:none}
+    .card.euros .n{color:var(--ambar)}
+    .card.euros::after{content:"";position:absolute;right:-30px;top:-30px;width:110px;height:110px;border-radius:50%;background:rgba(232,162,74,.12)}
+    .card.euros .l{color:rgba(255,255,255,.65)}
+
+    /* Secciones */
+    section{background:#fff;border:1px solid var(--borde);border-radius:18px;padding:1.6rem;margin-bottom:1.4rem}
+    h2{font-size:1.15rem;font-weight:600;margin-bottom:1.1rem}
+    .hint{color:var(--bruma);font-size:.78rem;font-weight:400;margin-left:.5rem;font-family:Inter}
+
+    /* Funnel */
+    .fila-funnel{display:grid;grid-template-columns:130px 1fr 60px;align-items:center;gap:1rem;padding:.45rem 0}
+    .fila-funnel .et{font-size:.85rem;font-weight:600}
+    .pista{background:var(--hueso2);border-radius:99px;height:22px;overflow:hidden}
+    .barra{height:100%;border-radius:99px;transition:width .6s ease}
+    .barra.b1{background:var(--bruma)} .barra.b2{background:var(--azul)} .barra.b3{background:var(--verde)}
+    .fila-funnel .num{text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+    .euros-linea{display:flex;justify-content:space-between;border-top:1px solid var(--hueso2);margin-top:.9rem;padding-top:.9rem;font-size:.9rem}
+    .euros-linea b{color:var(--verde)}
+
+    /* Tablas */
+    table{width:100%;border-collapse:collapse}
+    th{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--bruma);text-align:left;padding:.5rem .8rem;border-bottom:2px solid var(--hueso2);font-weight:600}
+    td{padding:.75rem .8rem;border-bottom:1px solid var(--hueso2);font-size:.88rem}
+    tr:last-child td{border-bottom:none}
+    tbody tr:hover td{background:var(--hueso)}
+    td.num{font-variant-numeric:tabular-nums;font-weight:600}
+    td.vacio{color:var(--bruma);font-style:italic;text-align:center;padding:1.6rem}
+    .chip{padding:.22rem .7rem;border-radius:99px;font-size:.72rem;font-weight:700}
+    .chip.ok,.chip.recuperado{background:var(--verde-bg);color:var(--verde)}
+    .chip.pendiente{background:var(--naranja-bg);color:var(--naranja)}
+    .chip.contactado{background:var(--azul-bg);color:var(--azul)}
+    .chip.baja{background:var(--rojo-bg);color:var(--rojo)}
+    details{margin-top:.8rem}
+    summary{cursor:pointer;color:var(--bruma);font-size:.82rem;font-weight:600}
+
+    .rgpd{font-size:.76rem;color:var(--bruma);text-align:center;margin:1.6rem 0 .4rem}
+    @media (max-width:640px){
+      body{padding:1.2rem .8rem}
+      h1{font-size:1.5rem}
+      .fila-funnel{grid-template-columns:90px 1fr 44px}
+      .acciones{width:100%}.btn{flex:1;text-align:center}
+    }
   </style></head><body>
     <header>
-      <div><h1>${clinica.nombre_clinica}</h1><p class="sub">Panel de resultados · en tiempo real</p></div>
+      <div>
+        <div class="marca">GanaPacientes</div>
+        <h1>${clinica.nombre_clinica}</h1>
+        <p class="sub">${fechaHoy}</p>
+      </div>
       <div class="acciones">
-        <a href="/subir-dormidos?clave=${clave}">Importar CSV</a>
-        <a class="ambar" href="/campana-dormidos?clave=${clave}&clinica=${clinicaId}" onclick="return confirm('¿Lanzar la campaña de reactivación a todos los pendientes de esta clínica?')">Lanzar campaña</a>
+        <a class="btn sec" href="/subir-dormidos?clave=${clave}">Importar CSV</a>
+        <a class="btn pri" href="/campana-dormidos?clave=${clave}&clinica=${clinicaId}" onclick="return confirm('Vas a enviar el WhatsApp de reactivación a TODOS los pacientes en estado pendiente de esta clínica. ¿Lanzar la campaña?')">Lanzar campaña</a>
       </div>
     </header>
+
     <div class="cards">
-      <div class="card euros"><div class="n">${eurosRec} €</div><div class="l">Ingresos recuperados</div></div>
-      <div class="card"><div class="n">${potencial} €</div><div class="l">Valor potencial en curso</div></div>
-      <div class="card"><div class="n">${pacientes.length}</div><div class="l">Pacientes</div></div>
-      <div class="card"><div class="n">${citas.length}</div><div class="l">Citas</div></div>
+      <div class="card euros"><div class="n">${fmtEuros(eurosRec)}</div><div class="l">Ingresos recuperados · confirmados</div></div>
+      <div class="card"><div class="n">${fmtEuros(potencial)}</div><div class="l">Valor potencial en curso</div></div>
+      <div class="card"><div class="n">${conversaciones}</div><div class="l">Conversaciones con Lucía</div></div>
+      <div class="card"><div class="n">${citas.length}</div><div class="l">Citas reservadas</div></div>
     </div>
-    <div class="cascada"><h2 style="margin-top:0">Recuperación · la cascada</h2>
-      <div class="paso"><b>En la lista</b><span>${activos.length}</span></div>
-      <div class="paso"><b>Contactados</b><span>${contactados}</span></div>
-      <div class="paso"><b>Recuperados</b><span>${recArr.length}</span></div>
-      <div class="paso"><b>€ confirmados</b><span>${eurosRec} €</span></div>
-    </div>
-    <h2>Citas</h2><table><tr><th>Paciente</th><th>Fecha</th><th>Hora</th><th>Estado</th></tr>${filasCitas}</table>
-    <h2>Ingresos Dormidos</h2><table><tr><th>Paciente</th><th>Tratamiento</th><th>Importe</th><th>Estado</th></tr>${filasDor}</table>
-    <p class="rgpd">${bajas.length} paciente(s) han ejercido su derecho de baja y no volverán a ser contactados (RGPD).</p>
+
+    <section>
+      <h2>Recuperación · la cascada <span class="hint">de la lista al sillón, sin maquillaje</span></h2>
+      <div class="fila-funnel"><span class="et">En la lista</span><div class="pista"><div class="barra b1" style="width:${activos.length ? 100 : 0}%"></div></div><span class="num">${activos.length}</span></div>
+      <div class="fila-funnel"><span class="et">Contactados</span><div class="pista"><div class="barra b2" style="width:${pct(contactados)}%"></div></div><span class="num">${contactados}</span></div>
+      <div class="fila-funnel"><span class="et">Recuperados</span><div class="pista"><div class="barra b3" style="width:${pct(recArr.length)}%"></div></div><span class="num">${recArr.length}</span></div>
+      <div class="euros-linea"><span>€ confirmados (solo pacientes que han reservado)</span><b>${fmtEuros(eurosRec)}</b></div>
+    </section>
+
+    <section>
+      <h2>Próximas citas</h2>
+      <table><thead><tr><th>Paciente</th><th>Fecha</th><th>Hora</th><th>Estado</th></tr></thead>
+      <tbody>${filasProximas}</tbody></table>
+      ${filasPasadas ? `<details><summary>Ver citas pasadas (${pasadas.length})</summary><table><tbody>${filasPasadas}</tbody></table></details>` : ""}
+    </section>
+
+    <section>
+      <h2>Ingresos Dormidos <span class="hint">ordenados por importe</span></h2>
+      <table><thead><tr><th>Paciente</th><th>Tratamiento</th><th>Importe</th><th>Estado</th></tr></thead>
+      <tbody>${filasDor}</tbody></table>
+    </section>
+
+    <p class="rgpd">${bajas.length} paciente(s) han ejercido su derecho de baja y no volverán a ser contactados (RGPD) · Panel GanaPacientes</p>
   </body></html>`);
 });
 
