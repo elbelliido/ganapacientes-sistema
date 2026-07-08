@@ -844,6 +844,99 @@ app.post("/formulario", async (req, res) => {
     res.status(500).json({ ok: false, error: "Error interno" });
   }
 });
+// ============================================================
+//  SOLICITUD DE CITA DESDE LA WEB + HUECOS REALES
+//  La web pinta la disponibilidad real (GET /huecos) y el paciente
+//  SOLICITA una cita (POST /solicitud-cita). Lucía le escribe con
+//  la solicitud ya masticada: si el hueco sigue libre lo reserva,
+//  y si no, propone alternativas. Todo pasa por el bot.
+// ============================================================
+
+// --- Huecos reales de una clínica para una fecha (para pintar el calendario) ---
+app.get("/huecos", async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  try {
+    const clinicaId = parseInt(req.query.clinica);
+    const fecha = req.query.fecha; // AAAA-MM-DD
+    if (!clinicaId || !/^\d{4}-\d{2}-\d{2}$/.test(fecha || "")) {
+      return res.status(400).json({ ok: false, error: "Parámetros inválidos" });
+    }
+    const { data: clinica } = await supabase
+      .from("clinicas").select("*").eq("id", clinicaId).eq("activa", true).single();
+    if (!clinica) return res.status(404).json({ ok: false, error: "Clínica no encontrada" });
+
+    const huecos = await consultarHuecos(fecha, clinica); // la función de siempre (Cal.com)
+    res.json({ ok: true, fecha, huecos });
+  } catch (e) {
+    console.error("Error /huecos:", e.message);
+    res.status(500).json({ ok: false, error: "Error interno" });
+  }
+});
+
+// --- Solicitud de cita: guarda el lead y Lucía escribe primero ---
+app.options("/solicitud-cita", (req, res) => {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  });
+  res.sendStatus(204);
+});
+
+app.post("/solicitud-cita", async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  try {
+    const { clinica_id, nombre, telefono, fecha, hora, empresa } = req.body || {};
+    if (empresa) return res.json({ ok: true }); // honeypot anti-spam
+
+    const clinicaId = parseInt(clinica_id);
+    if (!clinicaId || !nombre || !fecha || !hora) {
+      return res.status(400).json({ ok: false, error: "Faltan datos" });
+    }
+    let tel = (telefono || "").replace(/[\s\-\.]/g, "").replace(/^\+?34/, "");
+    if (!/^[6789]\d{8}$/.test(tel)) return res.status(400).json({ ok: false, error: "Teléfono no válido" });
+    tel = "34" + tel;
+
+    const { data: clinica } = await supabase
+      .from("clinicas").select("*").eq("id", clinicaId).eq("activa", true).single();
+    if (!clinica) return res.status(404).json({ ok: false, error: "Clínica no encontrada" });
+
+    // RGPD: si pidió la baja, guardamos el lead pero no escribimos
+    const { data: enBaja } = await supabase
+      .from("dormidos").select("id").eq("telefono", tel)
+      .eq("clinica_id", clinicaId).eq("estado", "baja").limit(1);
+
+    // Guardar el lead
+    await supabase.from("pacientes").insert({
+      clinica_id: clinicaId, nombre: nombre.trim(), telefono: tel,
+      interes: `Solicitud de cita: ${fecha} ${hora}`, origen: "solicitud_web"
+    });
+
+    if (!(enBaja || []).length) {
+      // Fecha bonita para el mensaje: "jueves 16 de julio a las 10:00"
+      const bonita = new Date(fecha + "T12:00:00")
+        .toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" }) +
+        " a las " + hora;
+
+      const enviado = await enviarPlantilla(clinica, tel, "solicitud_cita",
+        [nombre.trim().split(" ")[0], clinica.nombre_clinica, bonita]);
+
+      if (enviado) {
+        // Contexto para Lucía: cuando el paciente responda, ella remata.
+        await guardarMensaje(tel, "assistant",
+          `[Solicitud de cita desde la web: ${nombre.trim()} quiere el ${fecha} a las ${hora}. ` +
+          `Cuando responda: consulta los huecos de esa fecha con la herramienta. ` +
+          `Si la hora sigue libre, confirma y reserva a su nombre. Si está ocupada, ` +
+          `propónle las 2-3 horas libres más cercanas de ese día o del siguiente. ` +
+          `Ya tienes su nombre: no se lo vuelvas a pedir.]`, clinicaId);
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Error /solicitud-cita:", e.message);
+    res.status(500).json({ ok: false, error: "Error interno" });
+  }
+});
 
 // ============================================================
 //  ARRANQUE — app.listen SIEMPRE la última línea del archivo.
