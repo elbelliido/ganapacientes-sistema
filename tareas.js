@@ -1,70 +1,260 @@
 // ============================================================
-//  DASHBOARD MULTI-CLÍNICA + LOGIN
-//  Pega esto en servidor.js ANTES de app.listen(...)
-//  Uso: /dashboard?clave=TU_CLAVE&clinica=1
+//  GANAPACIENTES · tareas.js · VERSIÓN MEJORADA (Modelo B)
+//  Render Cron Job · schedule: 0 9 * * * · comando: node tareas.js
+//
+//  Cada mañana a las 9:00, para CADA clínica activa:
+//   1. RECORDATORIOS  → citas de MAÑANA (plantilla recordatorio_cita)
+//   2. REACTIVACIÓN   → dormidos en estado "pendiente"
+//                       (plantilla reactivacion_presupuesto)
+//   3. RESEÑAS        → citas de AYER sin reseña pedida
+//                       (plantilla gracias_visita, solo si la clínica
+//                        tiene link_resenas configurado)
+//
+//  MEJORAS DE ESTA VERSIÓN:
+//   - Aislamiento de errores: si una clínica falla (token caducado,
+//     lo que sea), las demás siguen. Antes un error paraba todo.
+//   - Anti-duplicados en recordatorios: columna recordatorio_enviado.
+//     Antes, si el cron corría dos veces, el paciente recibía dos.
+//   - Respeto RGPD en todo: los "baja" no reciben NADA, tampoco
+//     recordatorios ni reseñas.
+//   - Techo de seguridad en reactivación (máx. 100/día por clínica):
+//     protege el límite de mensajería de Meta y reparte campañas
+//     grandes en varios días automáticamente.
+//   - Fechas calculadas en zona Europe/Madrid (no la del servidor).
+//   - Pausa entre envíos (300 ms) para no saturar la API de Meta.
+//   - Resumen final por consola: lo que verás en los logs de Render.
+//
+//  SQL NECESARIO EN SUPABASE (una sola vez, SQL Editor):
+//    ALTER TABLE citas ADD COLUMN IF NOT EXISTS recordatorio_enviado boolean DEFAULT false;
+//    ALTER TABLE citas ADD COLUMN IF NOT EXISTS resena_enviada boolean DEFAULT false;
+//    ALTER TABLE clinicas ADD COLUMN IF NOT EXISTS link_resenas text;
+//
+//  ⚠️ VARIABLES DE PLANTILLA: revisa que el número de parámetros de
+//  cada envío coincida con los {{n}} de TU plantilla aprobada en Meta.
+//  Están marcados con "// ⚠️" más abajo. Si tu recordatorio_cita
+//  tiene 2 variables y aquí se mandan 3, Meta devuelve error.
 // ============================================================
 
-// Login sencillo para el dashboard
-app.use("/dashboard", (req, res, next) => {
-  if (req.query.clave === process.env.DASHBOARD_CLAVE) return next();
-  res.status(401).send("Acceso restringido. Añade ?clave=... a la URL");
-});
+require("dotenv").config();
+const axios = require("axios");
+const { createClient } = require("@supabase/supabase-js");
 
-app.get("/dashboard", async (req, res) => {
-  const clinicaId = Number(req.query.clinica || 1); // qué clínica ver
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-  // Datos SOLO de esa clínica
-  const [cli, pac, cit, dor] = await Promise.all([
-    supabase.from("clinicas").select("*").eq("id", clinicaId).single(),
-    supabase.from("pacientes").select("*").eq("clinica_id", clinicaId),
-    supabase.from("citas").select("*").eq("clinica_id", clinicaId),
-    supabase.from("dormidos").select("*").eq("clinica_id", clinicaId)
-  ]);
-  const clinica = cli.data || { nombre_clinica: "Clínica" };
-  const pacientes = pac.data || [], citas = cit.data || [], dormidos = dor.data || [];
+// ------------------------------------------------------------
+//  UTILIDADES DE FECHA (zona Europe/Madrid)
+// ------------------------------------------------------------
+function fechaMadrid(desplazamientoDias = 0) {
+  return new Date(Date.now() + desplazamientoDias * 24 * 60 * 60 * 1000)
+    .toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }); // AAAA-MM-DD
+}
+function diaBonito(fecha) {
+  return new Date(fecha + "T12:00:00").toLocaleDateString("es-ES", {
+    timeZone: "Europe/Madrid", weekday: "long", day: "numeric", month: "long"
+  });
+}
+const pausa = ms => new Promise(r => setTimeout(r, ms));
 
-  const contactados = dormidos.filter(d => d.estado !== "pendiente").length;
-  const recArr = dormidos.filter(d => d.estado === "recuperado");
-  const eurosRec = recArr.reduce((s, d) => s + Number(d.importe || 0), 0);
-  const potencial = dormidos.filter(d => d.estado !== "recuperado").reduce((s, d) => s + Number(d.importe || 0), 0);
+// ------------------------------------------------------------
+//  ENVÍO DE PLANTILLAS DE WHATSAPP (con parámetros)
+// ------------------------------------------------------------
+async function enviarPlantilla(clinica, telefono, nombrePlantilla, parametros = []) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v21.0/${clinica.phone_number_id}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: telefono,
+        type: "template",
+        template: {
+          name: nombrePlantilla,
+          language: { code: "es" },
+          components: parametros.length
+            ? [{ type: "body", parameters: parametros.map(p => ({ type: "text", text: String(p) })) }]
+            : []
+        }
+      },
+      { headers: { Authorization: `Bearer ${clinica.whatsapp_token}` } }
+    );
+    return true;
+  } catch (e) {
+    console.error(`   ❌ Plantilla ${nombrePlantilla} → ${telefono}:`, JSON.stringify(e.response?.data?.error?.message || e.message));
+    return false;
+  }
+}
 
-  const clave = req.query.clave;
-  const filasCitas = citas.map(c => `<tr><td>${c.nombre||"-"}</td><td>${c.fecha||"-"}</td><td>${c.hora||"-"}</td><td>${c.estado||"-"}</td></tr>`).join("") || `<tr><td colspan="4">Sin citas</td></tr>`;
-  const filasDor = dormidos.map(d => `<tr><td>${d.nombre||"-"}</td><td>${d.tratamiento||"-"}</td><td>${Number(d.importe||0)} €</td><td><span class="badge ${d.estado}">${d.estado}</span></td></tr>`).join("") || `<tr><td colspan="4">Sin dormidos</td></tr>`;
+// ------------------------------------------------------------
+//  RGPD: ¿este teléfono pidió la baja en esta clínica?
+// ------------------------------------------------------------
+async function estaEnBaja(telefono, clinicaId) {
+  const { data } = await supabase
+    .from("dormidos").select("id")
+    .eq("telefono", telefono).eq("clinica_id", clinicaId)
+    .eq("estado", "baja").limit(1);
+  return (data || []).length > 0;
+}
 
-  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Panel · ${clinica.nombre_clinica}</title><style>
-    :root{--tinta:#16212E;--tinta2:#1E2C3B;--hueso:#FAF7F2;--ambar:#E8A24A;--bruma:#9AA3AE;--borde:#E7E0D6}
-    *{box-sizing:border-box;margin:0;font-family:system-ui,sans-serif}
-    body{background:var(--hueso);color:var(--tinta);padding:2rem;max-width:1100px;margin:0 auto}
-    h1{font-size:1.6rem}.sub{color:var(--bruma);margin-bottom:2rem}
-    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:2.5rem}
-    .card{background:#fff;border:1px solid var(--borde);border-radius:14px;padding:1.4rem}
-    .card .n{font-size:2rem;font-weight:700}.card .l{color:var(--bruma);font-size:.85rem;margin-top:.2rem}
-    .card.euros{background:var(--tinta);color:#fff;border:none}.card.euros .n{color:var(--ambar)}
-    .cascada{background:#fff;border:1px solid var(--borde);border-radius:14px;padding:1.4rem;margin-bottom:2.5rem}
-    .paso{display:flex;justify-content:space-between;padding:.6rem 0;border-bottom:1px solid #f0ece4}.paso span{color:var(--bruma)}
-    h2{font-size:1.1rem;margin:1.5rem 0 .8rem}
-    table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;border:1px solid var(--borde)}
-    th,td{padding:.7rem 1rem;text-align:left;border-bottom:1px solid #f0ece4;font-size:.9rem}th{background:var(--tinta2);color:#fff}
-    .badge{padding:.2rem .6rem;border-radius:99px;font-size:.75rem;font-weight:600}
-    .badge.pendiente{background:#FFF4E8;color:#C45A0C}.badge.contactado{background:#EEF2FF;color:#1847ED}.badge.recuperado{background:#EDFAF4;color:#0B7A5A}
-    .switch{margin-bottom:1.5rem}.switch a{color:var(--bruma);text-decoration:none;margin-right:1rem;font-size:.85rem}
-  </style></head><body>
-    <h1>${clinica.nombre_clinica}</h1><p class="sub">Panel de resultados · en tiempo real</p>
-    <div class="cards">
-      <div class="card euros"><div class="n">${eurosRec} €</div><div class="l">Ingresos recuperados</div></div>
-      <div class="card"><div class="n">${potencial} €</div><div class="l">Valor potencial en curso</div></div>
-      <div class="card"><div class="n">${pacientes.length}</div><div class="l">Pacientes</div></div>
-      <div class="card"><div class="n">${citas.length}</div><div class="l">Citas</div></div>
-    </div>
-    <div class="cascada"><h2 style="margin-top:0">Recuperación · la cascada</h2>
-      <div class="paso"><b>En la lista</b><span>${dormidos.length}</span></div>
-      <div class="paso"><b>Contactados</b><span>${contactados}</span></div>
-      <div class="paso"><b>Recuperados</b><span>${recArr.length}</span></div>
-      <div class="paso"><b>€ confirmados</b><span>${eurosRec} €</span></div>
-    </div>
-    <h2>Citas</h2><table><tr><th>Paciente</th><th>Fecha</th><th>Hora</th><th>Estado</th></tr>${filasCitas}</table>
-    <h2>Ingresos Dormidos</h2><table><tr><th>Paciente</th><th>Tratamiento</th><th>Importe</th><th>Estado</th></tr>${filasDor}</table>
-  </body></html>`);
+// ------------------------------------------------------------
+//  1) RECORDATORIOS · citas de MAÑANA
+// ------------------------------------------------------------
+async function enviarRecordatorios(clinica, resumen) {
+  const manana = fechaMadrid(1);
+
+  const { data: citas } = await supabase
+    .from("citas").select("*")
+    .eq("clinica_id", clinica.id)
+    .eq("fecha", manana)
+    .eq("recordatorio_enviado", false);
+
+  for (const cita of citas || []) {
+    if (await estaEnBaja(cita.telefono, clinica.id)) {
+      await supabase.from("citas").update({ recordatorio_enviado: true }).eq("id", cita.id);
+      continue;
+    }
+
+    // ⚠️ AJUSTA los parámetros a TU plantilla recordatorio_cita:
+    // aquí se asume: {{1}} nombre · {{2}} clínica · {{3}} día · {{4}} hora
+    const ok = await enviarPlantilla(clinica, cita.telefono, "recordatorio_cita", [
+      (cita.nombre || "").split(" ")[0] || "paciente",
+      clinica.nombre_clinica,
+      diaBonito(cita.fecha),
+      cita.hora || ""
+    ]);
+
+    if (ok) {
+      await supabase.from("citas").update({ recordatorio_enviado: true }).eq("id", cita.id);
+      resumen.recordatorios++;
+      console.log(`   🔔 Recordatorio → ${cita.nombre || cita.telefono} (${cita.hora})`);
+    }
+    await pausa(300);
+  }
+}
+
+// ------------------------------------------------------------
+//  2) REACTIVACIÓN · dormidos en "pendiente"
+//     Techo de 100/día por clínica: campañas grandes se reparten
+//     solas en varios días, protegiendo el límite de Meta.
+// ------------------------------------------------------------
+const MAX_REACTIVACIONES_DIA = 100;
+
+async function reactivarDormidos(clinica, resumen) {
+  const { data: dormidos } = await supabase
+    .from("dormidos").select("*")
+    .eq("clinica_id", clinica.id)
+    .eq("estado", "pendiente")          // solo pendientes: bajas y demás quedan fuera
+    .limit(MAX_REACTIVACIONES_DIA);
+
+  for (const d of dormidos || []) {
+    // ⚠️ AJUSTA los parámetros a TU plantilla reactivacion_presupuesto:
+    // aquí se asume: {{1}} nombre · {{2}} tratamiento
+    const ok = await enviarPlantilla(clinica, d.telefono, "reactivacion_presupuesto", [
+      (d.nombre || "").split(" ")[0] || "paciente",
+      d.tratamiento || "tu tratamiento"
+    ]);
+
+    if (ok) {
+      await supabase.from("dormidos").update({ estado: "contactado" }).eq("id", d.id);
+      resumen.reactivados++;
+      console.log(`   💤→📲 Reactivado → ${d.nombre || d.telefono} (${d.tratamiento || "—"})`);
+    } else {
+      resumen.fallidos++;
+    }
+    await pausa(300);
+  }
+}
+
+// ------------------------------------------------------------
+//  3) RESEÑAS · citas de AYER sin reseña pedida
+//     Solo si la clínica tiene link_resenas (servicio activable
+//     clínica a clínica: es parte del plan Sistema Completo).
+// ------------------------------------------------------------
+async function enviarResenas(clinica, resumen) {
+  if (!clinica.link_resenas) return;
+
+  const ayer = fechaMadrid(-1);
+
+  const { data: citas } = await supabase
+    .from("citas").select("*")
+    .eq("clinica_id", clinica.id)
+    .eq("fecha", ayer)
+    .eq("resena_enviada", false);
+
+  for (const cita of citas || []) {
+    if (await estaEnBaja(cita.telefono, clinica.id)) {
+      await supabase.from("citas").update({ resena_enviada: true }).eq("id", cita.id);
+      continue;
+    }
+
+    // ⚠️ Parámetros de gracias_visita: {{1}} nombre · {{2}} clínica · {{3}} enlace
+    const ok = await enviarPlantilla(clinica, cita.telefono, "gracias_visita", [
+      (cita.nombre || "").split(" ")[0] || "paciente",
+      clinica.nombre_clinica,
+      clinica.link_resenas
+    ]);
+
+    if (ok) {
+      await supabase.from("citas").update({ resena_enviada: true }).eq("id", cita.id);
+      resumen.resenas++;
+      console.log(`   ⭐ Reseña pedida → ${cita.nombre || cita.telefono}`);
+    }
+    await pausa(300);
+  }
+}
+
+// ------------------------------------------------------------
+//  PRINCIPAL: recorre todas las clínicas activas.
+//  Cada clínica va en su propio try/catch: si una falla,
+//  las demás siguen funcionando.
+// ------------------------------------------------------------
+async function main() {
+  const inicio = Date.now();
+  console.log("═".repeat(50));
+  console.log(`🌅 GanaPacientes · tareas diarias · ${fechaMadrid()} `);
+  console.log("═".repeat(50));
+
+  const { data: clinicas, error } = await supabase
+    .from("clinicas").select("*").eq("activa", true);
+
+  if (error || !clinicas || clinicas.length === 0) {
+    console.error("⚠️ No se pudieron cargar clínicas activas:", error?.message || "lista vacía");
+    process.exit(1);
+  }
+
+  const total = { recordatorios: 0, reactivados: 0, resenas: 0, fallidos: 0 };
+
+  for (const clinica of clinicas) {
+    console.log(`\n🏥 ${clinica.nombre_clinica} (id ${clinica.id})`);
+
+    // Sanidad mínima de configuración antes de intentar nada
+    if (!clinica.phone_number_id || !clinica.whatsapp_token) {
+      console.error("   ⚠️ Clínica sin phone_number_id o token — saltada.");
+      continue;
+    }
+
+    const resumen = { recordatorios: 0, reactivados: 0, resenas: 0, fallidos: 0 };
+    try {
+      await enviarRecordatorios(clinica, resumen);
+      await reactivarDormidos(clinica, resumen);
+      await enviarResenas(clinica, resumen);
+      console.log(`   ✔ ${resumen.recordatorios} recordatorios · ${resumen.reactivados} reactivados · ${resumen.resenas} reseñas · ${resumen.fallidos} fallidos`);
+    } catch (e) {
+      console.error(`   ❌ Error en esta clínica (las demás continúan):`, e.message);
+    }
+
+    total.recordatorios += resumen.recordatorios;
+    total.reactivados += resumen.reactivados;
+    total.resenas += resumen.resenas;
+    total.fallidos += resumen.fallidos;
+  }
+
+  const segundos = ((Date.now() - inicio) / 1000).toFixed(1);
+  console.log("\n" + "═".repeat(50));
+  console.log(`✅ FIN · ${clinicas.length} clínica(s) · ${total.recordatorios} recordatorios · ${total.reactivados} reactivados · ${total.resenas} reseñas · ${total.fallidos} fallidos · ${segundos}s`);
+  console.log("═".repeat(50));
+  process.exit(0);
+}
+
+main().catch(e => {
+  console.error("❌ Error fatal en tareas.js:", e.message);
+  process.exit(1);
 });

@@ -752,6 +752,93 @@ app.post("/subir-dormidos", upload.single("csv"), async (req, res) => {
 app.get("/", (req, res) => {
   res.send("GanaPacientes · servidor multi-clínica activo ✅");
 });
+// ============================================================
+//  FORMULARIOS INTELIGENTES · MODELO B
+//  Pega este bloque en servidor.js ANTES de app.listen(...)
+//  (por ejemplo, justo después del bloque de subida de CSV).
+//
+//  Qué hace: la web de la clínica envía nombre + teléfono + interés
+//  a POST /formulario con el ID de la clínica. El sistema:
+//   1. Valida y guarda el lead en la tabla `pacientes`.
+//   2. Lucía escribe PRIMERO al lead por WhatsApp (plantilla
+//      `bienvenida_lead`, necesaria porque fuera de la ventana de
+//      24h Meta no permite texto libre).
+//   3. Guarda ese primer mensaje en `conversaciones`, de modo que
+//      cuando el lead responda, Lucía tenga el contexto ("me
+//      interesaba el implante") y siga la conversación con memoria.
+// ============================================================
+
+// CORS: la web de la clínica está en otro dominio, así que el
+// navegador exige estos permisos para poder enviar el formulario.
+app.options("/formulario", (req, res) => {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  });
+  res.sendStatus(204);
+});
+
+app.post("/formulario", async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  try {
+    const { clinica_id, nombre, telefono, interes, empresa } = req.body || {};
+
+    // Anti-spam (honeypot): el campo "empresa" está oculto en el HTML.
+    // Los humanos no lo ven; los bots de spam lo rellenan. Si llega
+    // con contenido, respondemos OK (para no dar pistas) y descartamos.
+    if (empresa) return res.json({ ok: true });
+
+    // Validaciones
+    const clinicaId = parseInt(clinica_id);
+    if (!clinicaId) return res.status(400).json({ ok: false, error: "Falta clinica_id" });
+    if (!nombre || !nombre.trim()) return res.status(400).json({ ok: false, error: "Falta el nombre" });
+
+    let tel = (telefono || "").replace(/[\s\-\.]/g, "").replace(/^\+?34/, "");
+    if (!/^[6789]\d{8}$/.test(tel)) return res.status(400).json({ ok: false, error: "Teléfono no válido" });
+    tel = "34" + tel;
+
+    // La clínica debe existir y estar activa
+    const { data: clinica } = await supabase
+      .from("clinicas").select("*").eq("id", clinicaId).eq("activa", true).single();
+    if (!clinica) return res.status(404).json({ ok: false, error: "Clínica no encontrada" });
+
+    // RGPD: si este teléfono pidió la baja en esta clínica, no le escribimos
+    const { data: enBaja } = await supabase
+      .from("dormidos").select("id").eq("telefono", tel)
+      .eq("clinica_id", clinicaId).eq("estado", "baja").limit(1);
+    const respetarBaja = (enBaja || []).length > 0;
+
+    // Guardamos el lead en `pacientes`
+    await supabase.from("pacientes").insert({
+      clinica_id: clinicaId,
+      nombre: nombre.trim(),
+      telefono: tel,
+      interes: (interes || "").trim() || null,
+      origen: "formulario_web"
+    });
+    console.log(`📝 [${clinica.nombre_clinica}] Lead nuevo: ${nombre} (${tel}) — ${interes || "sin interés indicado"}`);
+
+    // Primer contacto de Lucía (plantilla aprobada en Meta)
+    if (!respetarBaja) {
+      const enviado = await enviarPlantilla(clinica, tel, "bienvenida_lead",
+        [nombre.trim().split(" ")[0], clinica.nombre_clinica, (interes || "tu consulta").trim()]);
+
+      if (enviado) {
+        // Guardamos el mensaje en la memoria: cuando el lead responda,
+        // Lucía sabrá que le escribió primero y por qué.
+        await guardarMensaje(tel, "assistant",
+          `[Mensaje de bienvenida enviado desde el formulario web. El paciente se llama ${nombre.trim()} y ha indicado interés en: ${interes || "no especificado"}. Continúa la conversación con ese contexto y trata de agendar una cita.]`,
+          clinicaId);
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ Error /formulario:", e.message);
+    res.status(500).json({ ok: false, error: "Error interno" });
+  }
+});
 
 // ============================================================
 //  ARRANQUE — app.listen SIEMPRE la última línea del archivo.
