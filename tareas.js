@@ -117,7 +117,6 @@ async function enviarRecordatorios(clinica, resumen) {
     const ok = await enviarPlantilla(clinica, cita.telefono, "recordatorio_cita", [
       (cita.nombre || "").split(" ")[0] || "paciente",
       clinica.nombre_clinica,
-      diaBonito(cita.fecha),
       cita.hora || ""
     ]);
 
@@ -149,6 +148,7 @@ async function reactivarDormidos(clinica, resumen) {
     // aquí se asume: {{1}} nombre · {{2}} tratamiento
     const ok = await enviarPlantilla(clinica, d.telefono, "reactivacion_presupuesto", [
       (d.nombre || "").split(" ")[0] || "paciente",
+      clinica.nombre_clinica,
       d.tratamiento || "tu tratamiento"
     ]);
 
