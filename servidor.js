@@ -24,6 +24,9 @@
 //   8. RGPD: opt-out con "baja" + registro en conversaciones.
 //   9. CAMPAÑA DORMIDOS multi-clínica recuperada como ruta protegida.
 //  10. PUERTO: usa process.env.PORT (lo que Render espera).
+//  11. CINTURONES DE RESERVA: si la IA consulta huecos de un día
+//      pero intenta reservar en otro, el servidor corrige la fecha;
+//      y verifica que la hora sigue libre justo antes de reservar.
 // ============================================================
 
 require("dotenv").config();
@@ -102,6 +105,14 @@ function yaProcesado(idMensaje) {
   }
   return false;
 }
+
+// ============================================================
+//  CINTURÓN DE SEGURIDAD DE RESERVAS
+//  Última consulta de huecos por conversación (clínica+teléfono).
+//  Si la IA consulta huecos del día X pero luego intenta reservar
+//  en el día Y, corregimos la fecha automáticamente.
+// ============================================================
+const ultimaConsulta = new Map(); // clave: `${clinicaId}-${telefono}` → { fecha, huecos }
 
 // ============================================================
 //  ENVÍO DE WHATSAPP (reutilizable: webhook, campañas, bajas...)
@@ -236,13 +247,48 @@ const TOOLS = [
 ];
 
 async function ejecutarHerramienta(nombre, args, telefono, clinica) {
+  const clave = `${clinica.id}-${telefono}`;
+
   if (nombre === "consultarHuecos") {
-    return JSON.stringify({ fecha: args.fecha, huecosLibres: await consultarHuecos(args.fecha, clinica) });
+    const huecos = await consultarHuecos(args.fecha, clinica);
+    // Recordamos qué fecha se consultó y qué huecos había
+    ultimaConsulta.set(clave, { fecha: args.fecha, huecos });
+    if (ultimaConsulta.size > 500) {
+      // limpieza para que no crezca sin límite
+      const primera = ultimaConsulta.keys().next().value;
+      ultimaConsulta.delete(primera);
+    }
+    return JSON.stringify({ fecha: args.fecha, huecosLibres: huecos });
   }
+
   if (nombre === "reservarCita") {
-    const r = await reservarCita(args.fecha, args.hora, args.nombre, telefono, clinica);
-    return JSON.stringify({ reservado: r.ok });
+    let fecha = args.fecha;
+    const previa = ultimaConsulta.get(clave);
+
+    // 🛡️ CINTURÓN 1 — fecha cambiada: si la IA consultó huecos de una
+    // fecha pero intenta reservar en OTRA, y la hora elegida estaba en
+    // la lista consultada, la fecha buena es la consultada.
+    if (previa && fecha !== previa.fecha && previa.huecos.includes(args.hora)) {
+      console.log(`🛡️ Fecha corregida: la IA pidió ${fecha}, la consulta fue ${previa.fecha}`);
+      fecha = previa.fecha;
+    }
+
+    // 🛡️ CINTURÓN 2 — verificación final: la hora debe seguir libre
+    // en la fecha definitiva justo antes de reservar.
+    const libresAhora = await consultarHuecos(fecha, clinica);
+    if (!libresAhora.includes(args.hora)) {
+      return JSON.stringify({
+        reservado: false,
+        motivo: "hora_no_disponible",
+        fecha,
+        huecosLibres: libresAhora
+      });
+    }
+
+    const r = await reservarCita(fecha, args.hora, args.nombre, telefono, clinica);
+    return JSON.stringify({ reservado: r.ok, fecha, hora: args.hora });
   }
+
   return JSON.stringify({ error: "desconocida" });
 }
 
@@ -439,9 +485,6 @@ app.get("/campana-dormidos", async (req, res) => {
 
 // ============================================================
 //  DASHBOARD v2 · GANAPACIENTES
-//  INSTRUCCIONES: en servidor.js, borra el bloque app.get("/dashboard", ...)
-//  ENTERO (desde app.get("/dashboard" hasta su }); de cierre) y pega
-//  este en su lugar. El app.use("/dashboard", ...) del login NO se toca.
 // ============================================================
 
 app.get("/dashboard", async (req, res) => {
@@ -757,11 +800,9 @@ app.post("/subir-dormidos", upload.single("csv"), async (req, res) => {
 app.get("/", (req, res) => {
   res.send("GanaPacientes · servidor multi-clínica activo ✅");
 });
+
 // ============================================================
 //  FORMULARIOS INTELIGENTES · MODELO B
-//  Pega este bloque en servidor.js ANTES de app.listen(...)
-//  (por ejemplo, justo después del bloque de subida de CSV).
-//
 //  Qué hace: la web de la clínica envía nombre + teléfono + interés
 //  a POST /formulario con el ID de la clínica. El sistema:
 //   1. Valida y guarda el lead en la tabla `pacientes`.
@@ -844,6 +885,7 @@ app.post("/formulario", async (req, res) => {
     res.status(500).json({ ok: false, error: "Error interno" });
   }
 });
+
 // ============================================================
 //  SOLICITUD DE CITA DESDE LA WEB + HUECOS REALES
 //  La web pinta la disponibilidad real (GET /huecos) y el paciente
