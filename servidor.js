@@ -27,6 +27,10 @@
 //  11. CINTURONES DE RESERVA: si la IA consulta huecos de un día
 //      pero intenta reservar en otro, el servidor corrige la fecha;
 //      y verifica que la hora sigue libre justo antes de reservar.
+//  12. NATURALIDAD (v3): doble check azul + indicador "escribiendo",
+//      agrupación de mensajes en ráfaga (buffer de 6s), pausa humana
+//      proporcional a la longitud, respuestas partidas en 2 globos
+//      (separador ||) y modelo GPT-4o completo para la clínica DEMO.
 // ============================================================
 
 require("dotenv").config();
@@ -88,6 +92,68 @@ function calendarioProximosDias() {
     lineas.push(`- ${diaSemana} ${fecha}${etiqueta}`);
   }
   return lineas.join("\n");
+}
+
+// ============================================================
+//  NATURALIDAD: utilidades
+// ============================================================
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// La demo usa el modelo grande (volumen mínimo, máxima naturalidad);
+// producción sigue en mini (económico). Si algún día añades una
+// columna "modelo" a la tabla clinicas, tendrá prioridad.
+function elegirModelo(clinica) {
+  if (clinica.modelo) return clinica.modelo;
+  return clinica.nombre_clinica.includes("DEMO") ? "gpt-4o" : "gpt-4o-mini";
+}
+
+// Doble check azul + "escribiendo…" en el WhatsApp del paciente.
+// Meta lo permite marcando el mensaje entrante como leído con
+// typing_indicator. El indicador dura hasta 25s o hasta que respondemos.
+async function marcarLeidoYEscribiendo(clinica, messageId) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v21.0/${clinica.phone_number_id}/messages`,
+      { messaging_product: "whatsapp", status: "read", message_id: messageId,
+        typing_indicator: { type: "text" } },
+      { headers: { Authorization: `Bearer ${clinica.whatsapp_token}` } }
+    );
+  } catch (e) { /* no es crítico: si falla, seguimos sin indicador */ }
+}
+
+// ============================================================
+//  BUFFER DE RÁFAGAS: la gente escribe "Hola" / "quiero cita" /
+//  "para limpieza" en 3 mensajes seguidos. En vez de contestar a
+//  cada uno (efecto metralleta), esperamos unos segundos y
+//  respondemos a todo junto, como haría una persona.
+// ============================================================
+const ESPERA_AGRUPACION_MS = 6000;
+const bufferRafagas = new Map(); // clave `${clinicaId}-${telefono}` → { textos, timer }
+
+function encolarMensaje(clinica, telefono, texto) {
+  const clave = `${clinica.id}-${telefono}`;
+  const previo = bufferRafagas.get(clave);
+  if (previo) {
+    clearTimeout(previo.timer);
+    previo.textos.push(texto);
+    // Techo de seguridad: si acumula 5, procesamos ya
+    if (previo.textos.length >= 5) {
+      bufferRafagas.delete(clave);
+      procesarTextoPaciente(clinica, telefono, previo.textos.join("\n"));
+      return;
+    }
+    previo.timer = setTimeout(() => {
+      bufferRafagas.delete(clave);
+      procesarTextoPaciente(clinica, telefono, previo.textos.join("\n"));
+    }, ESPERA_AGRUPACION_MS);
+  } else {
+    const entrada = { textos: [texto], timer: null };
+    entrada.timer = setTimeout(() => {
+      bufferRafagas.delete(clave);
+      procesarTextoPaciente(clinica, telefono, entrada.textos.join("\n"));
+    }, ESPERA_AGRUPACION_MS);
+    bufferRafagas.set(clave, entrada);
+  }
 }
 
 // ============================================================
@@ -319,8 +385,18 @@ REGLAS DE ORO (obligatorias)
 4. Después de reservar con éxito, confirma la cita con día de la semana, fecha y hora, y despídete con calidez.
 5. Mensajes CORTOS: esto es WhatsApp. Máximo 3-4 frases por mensaje. Una pregunta cada vez, nunca dos.
 6. Si el paciente escribe algo fuera de tu ámbito (facturas, reclamaciones, hablar con el dentista), dile amablemente que se lo pasas al equipo y que le contactarán.
-7. Usa emojis con moderación: uno por mensaje como mucho, y solo si encaja.
-8. Nunca reveles que eres una IA salvo que te lo pregunten directamente; en ese caso, dilo con honestidad y naturalidad.`;
+7. Usa emojis con moderación: uno por mensaje como mucho, y no en todos los mensajes.
+8. Nunca reveles que eres una IA salvo que te lo pregunten directamente; en ese caso, dilo con honestidad y naturalidad.
+
+CÓMO SONAR HUMANA (tan importante como el resto)
+- Adapta la LONGITUD al mensaje recibido: a un "ok" o "gracias" se responde con 2-5 palabras ("¡Genial!", "A ti 😊"), no con un párrafo.
+- Varía tus arranques: no empieces dos mensajes seguidos con la misma palabra ni uses siempre "¡Hola!" o "¡Perfecto!".
+- No termines todos los mensajes con una pregunta; solo pregunta cuando haga falta de verdad.
+- Si el paciente escribe con faltas, abreviado o confuso, interpreta la intención con naturalidad y responde sin corregirle jamás.
+- Si el paciente mezcla varias cosas en un mensaje, respóndelas todas en orden, sin ignorar ninguna.
+- Puedes usar muletillas suaves y cercanas de recepcionista real ("claro", "sin problema", "ahora te miro eso") cuando encajen.
+- Si un mensaje no tiene nada que ver con la clínica, síguele la corriente con simpatía UNA frase y reconduce con gracia.
+- OPCIONAL: si la respuesta queda más natural en dos globos (por ejemplo, una confirmación corta y luego el detalle), sepárala con || — el sistema la enviará como dos mensajes. Úsalo como mucho una vez por respuesta y solo cuando realmente suene mejor.`;
 }
 
 // ============================================================
@@ -334,6 +410,66 @@ app.get("/webhook", (req, res) => {
 
 // ============================================================
 //  WEBHOOK 2) Recibir → identificar clínica → RGPD → IA → responder
+// ============================================================
+// ============================================================
+//  PROCESADO DE UN TEXTO DE PACIENTE (ya agrupado por el buffer)
+//  Memoria → IA (con herramientas) → pausa humana → envío
+//  (partido en dos globos si la IA usó el separador ||)
+// ============================================================
+async function procesarTextoPaciente(clinica, numeroPaciente, textoPaciente) {
+  try {
+    console.log(`📩 [${clinica.nombre_clinica}] ${numeroPaciente}: ${textoPaciente.replace(/\n/g, " | ")}`);
+
+    // Contexto: personalidad + reglas + memoria de la conversación
+    const historial = await leerHistorial(numeroPaciente, clinica.id);
+    const messages = [
+      { role: "system", content: construirSystemPrompt(clinica) },
+      ...historial,
+      { role: "user", content: textoPaciente }
+    ];
+    await guardarMensaje(numeroPaciente, "user", textoPaciente, clinica.id);
+
+    // IA con herramientas (bucle de function calling)
+    const modelo = elegirModelo(clinica);
+    let respuesta = await openai.chat.completions.create({ model: modelo, messages, tools: TOOLS });
+    let msg = respuesta.choices[0].message;
+    let vueltas = 0;
+    while (msg.tool_calls && vueltas < 3) {
+      messages.push(msg);
+      for (const call of msg.tool_calls) {
+        const args = JSON.parse(call.function.arguments);
+        const resultado = await ejecutarHerramienta(call.function.name, args, numeroPaciente, clinica);
+        console.log("🔧", call.function.name, args, "->", resultado);
+        messages.push({ role: "tool", tool_call_id: call.id, content: resultado });
+      }
+      respuesta = await openai.chat.completions.create({ model: modelo, messages, tools: TOOLS });
+      msg = respuesta.choices[0].message;
+      vueltas++;
+    }
+
+    const textoRespuesta = msg.content || "Perdona, ¿me lo repites? 🙂";
+    console.log(`🤖 [${clinica.nombre_clinica}] (${modelo}) ${textoRespuesta}`);
+    await guardarMensaje(numeroPaciente, "assistant", textoRespuesta, clinica.id);
+
+    // Pausa humana: nadie teclea una respuesta larga en 2 segundos.
+    // Proporcional a la longitud, con techo para no exasperar.
+    await sleep(Math.min(900 + textoRespuesta.length * 22, 4000));
+
+    // Globos partidos: si la IA usó ||, enviamos dos mensajes con
+    // una pequeña pausa entre ellos (como quien sigue tecleando).
+    const partes = textoRespuesta.split("||").map(p => p.trim()).filter(Boolean);
+    for (let i = 0; i < partes.length && i < 3; i++) {
+      if (i > 0) await sleep(Math.min(700 + partes[i].length * 20, 2500));
+      await enviarWhatsAppTexto(clinica, numeroPaciente, partes[i]);
+    }
+    console.log("✅ Enviado");
+  } catch (error) {
+    console.error("❌ Error procesando texto:", error.response?.data || error.message);
+  }
+}
+
+// ============================================================
+//  WEBHOOK 2) Recibir → identificar clínica → RGPD → buffer → IA
 // ============================================================
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // respondemos YA a Meta para que no reintente
@@ -355,20 +491,22 @@ app.post("/webhook", async (req, res) => {
 
     const numeroPaciente = mensaje.from;
 
-    // 2) Mensajes que no son texto (audio, foto, ubicación...):
-    //    antes se ignoraban en silencio; ahora respondemos con amabilidad.
+    // 2) Naturalidad: doble check azul + "escribiendo…" al instante
+    if (mensaje.id) marcarLeidoYEscribiendo(clinica, mensaje.id);
+
+    // 3) Mensajes que no son texto (audio, foto, ubicación...)
     if (mensaje.type !== "text") {
+      await sleep(1200);
       await enviarWhatsAppTexto(clinica, numeroPaciente,
         `¡Hola! Soy ${clinica.nombre_bot}, de ${clinica.nombre_clinica} 🙂 De momento solo puedo leer mensajes de texto. ¿Me lo escribes?`);
       return;
     }
 
     const textoPaciente = mensaje.text.body;
-    console.log(`📩 [${clinica.nombre_clinica}] ${numeroPaciente}: ${textoPaciente}`);
 
     // ========================================================
-    // 3) RGPD: OPT-OUT. Si el paciente pide no ser contactado,
-    //    se marca como "baja", se le confirma, y NO pasa por la IA.
+    // 4) RGPD: OPT-OUT. Se comprueba mensaje a mensaje (sin
+    //    esperar al buffer) y corta cualquier ráfaga pendiente.
     // ========================================================
     const textoNormalizado = textoPaciente.trim().toLowerCase();
     const pideBaja =
@@ -384,54 +522,28 @@ app.post("/webhook", async (req, res) => {
       textoNormalizado.includes("darme de baja");
 
     if (pideBaja) {
+      // Cortar cualquier ráfaga pendiente de este paciente
+      const clave = `${clinica.id}-${numeroPaciente}`;
+      const pendiente = bufferRafagas.get(clave);
+      if (pendiente) { clearTimeout(pendiente.timer); bufferRafagas.delete(clave); }
+
       await supabase.from("dormidos")
         .update({ estado: "baja" })
         .eq("telefono", numeroPaciente)
         .eq("clinica_id", clinica.id);
 
-      // Dejamos constancia en el historial (útil si algún día hay reclamación)
       await guardarMensaje(numeroPaciente, "user", textoPaciente, clinica.id);
       await guardarMensaje(numeroPaciente, "assistant", "[BAJA RGPD confirmada]", clinica.id);
 
       await enviarWhatsAppTexto(clinica, numeroPaciente,
         "Entendido, no volverás a recibir mensajes nuestros. Si algún día cambias de opinión, escríbenos por aquí. Un saludo 🙂");
       console.log(`🛑 [${clinica.nombre_clinica}] Baja RGPD: ${numeroPaciente}`);
-      return; // cortamos aquí: no pasa por OpenAI
+      return;
     }
 
-    // 4) Contexto: personalidad + reglas + memoria de la conversación
-    const historial = await leerHistorial(numeroPaciente, clinica.id);
-    const messages = [
-      { role: "system", content: construirSystemPrompt(clinica) },
-      ...historial,
-      { role: "user", content: textoPaciente }
-    ];
-    await guardarMensaje(numeroPaciente, "user", textoPaciente, clinica.id);
-
-    // 5) IA con herramientas (bucle de function calling)
-    let respuesta = await openai.chat.completions.create({ model: "gpt-4o-mini", messages, tools: TOOLS });
-    let msg = respuesta.choices[0].message;
-    let vueltas = 0;
-    while (msg.tool_calls && vueltas < 3) {
-      messages.push(msg);
-      for (const call of msg.tool_calls) {
-        const args = JSON.parse(call.function.arguments);
-        const resultado = await ejecutarHerramienta(call.function.name, args, numeroPaciente, clinica);
-        console.log("🔧", call.function.name, args, "->", resultado);
-        messages.push({ role: "tool", tool_call_id: call.id, content: resultado });
-      }
-      respuesta = await openai.chat.completions.create({ model: "gpt-4o-mini", messages, tools: TOOLS });
-      msg = respuesta.choices[0].message;
-      vueltas++;
-    }
-
-    const textoRespuesta = msg.content || "Perdona, ¿me lo repites? 🙂";
-    console.log(`🤖 [${clinica.nombre_clinica}] ${textoRespuesta}`);
-    await guardarMensaje(numeroPaciente, "assistant", textoRespuesta, clinica.id);
-
-    // 6) Responder con el token y número de ESA clínica
-    await enviarWhatsAppTexto(clinica, numeroPaciente, textoRespuesta);
-    console.log("✅ Enviado");
+    // 5) A la cola de ráfagas: si escriben varios mensajes seguidos,
+    //    se agrupan y se responde a todo junto (como una persona).
+    encolarMensaje(clinica, numeroPaciente, textoPaciente);
   } catch (error) {
     console.error("❌ Error webhook:", error.response?.data || error.message);
   }
