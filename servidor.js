@@ -412,6 +412,119 @@ app.get("/webhook", (req, res) => {
 //  WEBHOOK 2) Recibir → identificar clínica → RGPD → IA → responder
 // ============================================================
 // ============================================================
+//  MÓDULO DE RESEÑAS
+//  Flujo: /campana-resenas envía la plantilla de valoración a las
+//  citas pasadas. Si el paciente responde un número 1-5, se gestiona
+//  aquí SIN pasar por la IA: 4-5 → enlace de reseña de Google;
+//  1-3 → se pide el detalle y queda registrado internamente.
+// ============================================================
+async function gestionarResena(clinica, telefono, texto) {
+  // Últimos 2 mensajes del asistente para saber en qué punto estamos
+  const { data } = await supabase
+    .from("conversaciones").select("rol,contenido")
+    .eq("telefono", telefono).eq("clinica_id", clinica.id)
+    .order("creado", { ascending: false }).limit(4);
+  const ultimoAsistente = (data || []).find(m => m.rol === "assistant");
+  if (!ultimoAsistente) return false;
+
+  // CASO A: esperábamos la puntuación (1-5)
+  if (ultimoAsistente.contenido.includes("[Solicitud de reseña")) {
+    const m = texto.trim().match(/^[^0-9]*([1-5])(?![0-9])/);
+    if (!m) return false; // no es una puntuación: que siga la IA
+    const puntuacion = Number(m[1]);
+
+    await supabase.from("resenas").insert({
+      clinica_id: clinica.id, telefono, puntuacion
+    });
+    await guardarMensaje(telefono, "user", texto, clinica.id);
+
+    if (puntuacion >= 4 && clinica.gmb_review_url) {
+      const msg = `¡Nos alegra muchísimo! 😊 ¿Nos ayudarías dejando esa valoración en Google? Solo es un momento y nos ayuda de verdad: ${clinica.gmb_review_url}\n¡Gracias y hasta pronto!`;
+      await guardarMensaje(telefono, "assistant", msg, clinica.id);
+      await sleep(1200);
+      await enviarWhatsAppTexto(clinica, telefono, msg);
+    } else if (puntuacion >= 4) {
+      const msg = "¡Nos alegra muchísimo! 😊 Gracias por contárnoslo. ¡Hasta pronto!";
+      await guardarMensaje(telefono, "assistant", msg, clinica.id);
+      await sleep(1200);
+      await enviarWhatsAppTexto(clinica, telefono, msg);
+    } else {
+      const msg = "Vaya, sentimos que no fuera perfecta 😔 ¿Nos cuentas qué podemos mejorar? Lo lee directamente el equipo de la clínica. [Reseña interna: esperando comentario]";
+      // El marcador va solo en la memoria, no en el WhatsApp:
+      await guardarMensaje(telefono, "assistant", msg, clinica.id);
+      await sleep(1200);
+      await enviarWhatsAppTexto(clinica, telefono,
+        "Vaya, sentimos que no fuera perfecta 😔 ¿Nos cuentas qué podemos mejorar? Lo lee directamente el equipo de la clínica.");
+    }
+    return true; // gestionado: no pasa por la IA
+  }
+
+  // CASO B: esperábamos el comentario de una reseña negativa
+  if (ultimoAsistente.contenido.includes("[Reseña interna: esperando comentario]")) {
+    // Guardamos el comentario en la última reseña de este paciente
+    const { data: ult } = await supabase
+      .from("resenas").select("id")
+      .eq("telefono", telefono).eq("clinica_id", clinica.id)
+      .order("creado", { ascending: false }).limit(1);
+    if (ult && ult[0]) {
+      await supabase.from("resenas").update({ comentario: texto }).eq("id", ult[0].id);
+    }
+    await guardarMensaje(telefono, "user", texto, clinica.id);
+    const gracias = "Gracias de verdad por contárnoslo — el equipo lo revisará para mejorar. Un saludo 🙂";
+    await guardarMensaje(telefono, "assistant", gracias, clinica.id);
+    await sleep(1200);
+    await enviarWhatsAppTexto(clinica, telefono, gracias);
+    return true;
+  }
+
+  return false;
+}
+
+// ============================================================
+//  CAMPAÑA DE RESEÑAS (protegida): envía la plantilla de
+//  valoración a las citas ya pasadas que aún no la recibieron.
+//  Uso: /campana-resenas?clave=TU_CLAVE&clinica=1
+// ============================================================
+app.get("/campana-resenas", async (req, res) => {
+  if (req.query.clave !== process.env.DASHBOARD_CLAVE) {
+    return res.status(401).send("Acceso denegado");
+  }
+  try {
+    const clinicaId = Number(req.query.clinica);
+    if (!clinicaId) return res.status(400).send("Falta ?clinica=ID");
+    const { data: clinica } = await supabase
+      .from("clinicas").select("*").eq("id", clinicaId).eq("activa", true).single();
+    if (!clinica) return res.status(404).send("Clínica no encontrada");
+
+    const hoy = hoyMadrid();
+    const { data: citas } = await supabase
+      .from("citas").select("*")
+      .eq("clinica_id", clinicaId)
+      .lt("fecha", hoy)
+      .or("resena_solicitada.is.null,resena_solicitada.eq.false")
+      .limit(100);
+
+    let enviadas = 0, fallidas = 0;
+    for (const c of citas || []) {
+      const ok = await enviarPlantilla(clinica, c.telefono, "solicitud_resena",
+        [(c.nombre || "").split(" ")[0] || "paciente", clinica.nombre_clinica]);
+      if (ok) {
+        await supabase.from("citas").update({ resena_solicitada: true }).eq("id", c.id);
+        await guardarMensaje(c.telefono, "assistant",
+          "[Solicitud de reseña enviada. Si responde con un número del 1 al 5, es su valoración de la visita.]",
+          clinicaId);
+        enviadas++;
+      } else fallidas++;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    res.send(`Campaña de reseñas [${clinica.nombre_clinica}]: ${enviadas} enviadas, ${fallidas} fallidas.`);
+  } catch (e) {
+    console.error("Error campaña reseñas:", e.message);
+    res.status(500).send("Error: " + e.message);
+  }
+});
+
+// ============================================================
 //  PROCESADO DE UN TEXTO DE PACIENTE (ya agrupado por el buffer)
 //  Memoria → IA (con herramientas) → pausa humana → envío
 //  (partido en dos globos si la IA usó el separador ||)
@@ -419,6 +532,13 @@ app.get("/webhook", (req, res) => {
 async function procesarTextoPaciente(clinica, numeroPaciente, textoPaciente) {
   try {
     console.log(`📩 [${clinica.nombre_clinica}] ${numeroPaciente}: ${textoPaciente.replace(/\n/g, " | ")}`);
+
+    // ¿Es la respuesta a una solicitud de reseña? Si sí, se gestiona
+    // de forma determinista (sin IA) y terminamos aquí.
+    if (await gestionarResena(clinica, numeroPaciente, textoPaciente)) {
+      console.log(`⭐ [${clinica.nombre_clinica}] Reseña gestionada de ${numeroPaciente}`);
+      return;
+    }
 
     // Contexto: personalidad + reglas + memoria de la conversación
     const historial = await leerHistorial(numeroPaciente, clinica.id);
